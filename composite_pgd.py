@@ -73,19 +73,21 @@ class PGD(nn.Module):
         self.eps_space = [self.eps_pool[i] for i in self.enabled_attack]
         self.adv_val_space = [self.adv_val_pool[i] for i in self.enabled_attack]
 
-        self.curr_dsm = sinkhorn.initial_dsm(self.seq_num)
-        self.curr_seq = sinkhorn.convert_dsm_to_sequence(self.curr_dsm)
-        if self.order_schedule == 'fixed':
-            self.fixed_order = tuple([self.enabled_attack.index(i) for i in self.fixed_order])
-            self.curr_seq = torch.tensor(self.fixed_order).cuda()
-            self.curr_dsm = sinkhorn.convert_seq_to_dsm(self.curr_seq)
+        if self.curr_seq is None:
+            self.curr_dsm = sinkhorn.initial_dsm(self.seq_num)
+            self.curr_seq = sinkhorn.convert_dsm_to_sequence(self.curr_dsm)
+
+            if self.order_schedule == 'fixed':
+                self.fixed_order = tuple([self.enabled_attack.index(i) for i in self.fixed_order])
+                self.curr_seq = torch.tensor(self.fixed_order).cuda()
+                self.curr_dsm = sinkhorn.convert_seq_to_dsm(self.curr_seq)
+
+            assert self.curr_seq is not None
 
     def forward(self, inputs, labels):
         if self.batch_size != inputs.shape[0]:
             self.batch_size = inputs.shape[0]
             self._setup_attack()
-
-        assert self.curr_seq is not None
 
         self.is_attacked = torch.zeros(self.batch_size).bool().cuda()
         self.is_not_attacked = torch.ones(self.batch_size).bool().cuda()
