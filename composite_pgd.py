@@ -81,9 +81,10 @@ class PGD(nn.Module):
             self.curr_dsm = sinkhorn.convert_seq_to_dsm(self.curr_seq)
 
     def forward(self, inputs, labels):
-        self.batch_size = inputs.shape[0]
-        if self.curr_seq is None:
+        if self.batch_size != inputs.shape[0]:
+            self.batch_size = inputs.shape[0]
             self._setup_attack()
+
         assert self.curr_seq is not None
 
         self.is_attacked = torch.zeros(self.batch_size).bool().cuda()

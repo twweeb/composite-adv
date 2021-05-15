@@ -9,3 +9,4 @@ out
 gen
 __pycache__
 model_logs/
+result/
