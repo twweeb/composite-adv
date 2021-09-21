@@ -10,5 +10,7 @@ gen
 __pycache__
 model_logs/
 result/
-run_adv*.sh
+*.sh
+eval_result/
+images/
 

@@ -102,13 +102,16 @@ def trades_loss(model,
     optimizer.zero_grad()
     # calculate robust loss
     logits = model(x_natural)
+    adv_logits = model(x_adv)
     if local_rank!=-1:
         loss_natural = F.cross_entropy(logits, y).cuda(local_rank)
+        loss_adv = F.cross_entropy(adv_logits, y).cuda(local_rank)
         loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
                                                         F.softmax(model(x_natural), dim=1)).cuda(local_rank)
     else:
         loss_natural = F.cross_entropy(logits, y)
+        loss_adv = F.cross_entropy(adv_logits, y)
         loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
                                                         F.softmax(model(x_natural), dim=1))
     loss = loss_natural + beta * loss_robust
-    return loss
+    return loss, loss_natural, loss_adv
