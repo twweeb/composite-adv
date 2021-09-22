@@ -2,14 +2,11 @@ from __future__ import print_function
 import os
 import warnings
 import argparse
-import shutil
 import csv
 import torch.multiprocessing as mp
-import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-from torch import optim
 from torch.optim import lr_scheduler
 from torch.utils.data import SubsetRandomSampler, DataLoader
 from torchvision import datasets, transforms
@@ -20,7 +17,7 @@ from torchvision.models import resnet50
 import matplotlib.pyplot as plt
 from livelossplot import PlotLosses
 from livelossplot.outputs import MatplotlibPlot
-import sys
+from generalized_order_attack.attacks import *
 from trades import trades_loss
 
 
@@ -46,6 +43,14 @@ parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                     help='SGD momentum')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
+parser.add_argument('--epsilon', default=0.031,
+                    help='perturbation')
+parser.add_argument('--num-steps', default=10,
+                    help='perturb number of steps')
+parser.add_argument('--step-size', default=0.007,
+                    help='perturb step size')
+parser.add_argument('--beta', default=6.0, type=float,
+                    help='regularization, i.e., 1/lambda in TRADES')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--log-interval', type=int, default=100, metavar='N',
@@ -56,16 +61,22 @@ parser.add_argument('--model-dir', default='./model-cifar-wideResNet',
                     help='directory of model for saving checkpoint')
 parser.add_argument('--save-freq', '-s', default=1, type=int, metavar='N',
                     help='save frequency')
+parser.add_argument('--dist', default='comp', type=str,
+                    help='distance metric')
 parser.add_argument('--mode', default='natural', type=str,
                     help='specify training mode (natural or adv_train)')
 parser.add_argument('--order', default='random', type=str, help='specify the order')
-parser.add_argument('--model_path', default='./adv_train', help='directory of model for loading checkpoint')
+parser.add_argument('--checkpoint', type=str, default=None, help='path of checkpoint')
+parser.add_argument('--stat-dict', type=str, default=None,
+                    help='key of stat dict in checkpoint')
 parser.add_argument("--enable", type=list_type, default=(0, 1), help="list of enabled attacks")
+parser.add_argument("--power", type=str, default='strong', help="level of attack power")
+parser.add_argument("--linf_loss", type=str, default='ce', help="loss for linf-attack, ce or kl")
 parser.add_argument("--log_filename", default='logfile.csv', help="filename of output log")
-
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str, help='url used to set up distributed training')
+parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+                    help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
 parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
 parser.add_argument('--multiprocessing-distributed', action='store_true',
@@ -74,7 +85,25 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
+
+class Normalize(nn.Module):
+    def __init__(self, mean, std):
+        super().__init__()
+        self.normalize = transforms.Normalize(mean=mean, std=std)
+
+    def forward(self, input_tensor):
+        return self.normalize(input_tensor)
+
+
 best_acc1 = 0
+
+start_num = 1
+iter_num = 1
+inner_iter_num = 10
+
+sequence_single = [(0,), (1,), (2,), (3,), (4,), (5,)]
+attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
+
 
 def main():
     # settings
@@ -97,11 +126,7 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
     ngpus_per_node = torch.cuda.device_count()
     if args.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
@@ -128,23 +153,19 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    model, epoch, optimizer, criterion, best_acc1 = load_model(args, ngpus_per_node)
+    model, epoch, optimizer, criterion = load_model(args, ngpus_per_node)
     cudnn.benchmark = True
 
     # setup data loader
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        # normalize,
     ])
     transform_test = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        # normalize,
     ])
 
     DATA_DIR = '/work/hsiung1024/imagenet'  # Original images come in shapes of [3,64,64]
@@ -152,11 +173,11 @@ def main_worker(gpu, ngpus_per_node, args):
     TRAIN_DIR = os.path.join(DATA_DIR, 'train')
     VALID_DIR = os.path.join(DATA_DIR, 'val')
 
-    train_loader = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=ngpus_per_node*4,
+    train_loader = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=ngpus_per_node * 4,
                                        batch_size=args.batch_size, distributed=args.distributed)
-    test_loader = generate_dataloader(VALID_DIR, "val", transform_test, workers=ngpus_per_node*4,
-                                      batch_size=args.batch_size)
-    train(model, epoch, optimizer, criterion, best_acc1, train_loader, test_loader, args)
+    test_loader = generate_dataloader(VALID_DIR, "val", transform_test, workers=ngpus_per_node * 4,
+                                      batch_size=args.test_batch_size)
+    train(model, epoch, optimizer, criterion, train_loader, test_loader, args)
 
 
 def generate_dataloader(data, name, transform, workers, batch_size, distributed=False):
@@ -188,33 +209,81 @@ def generate_dataloader(data, name, transform, workers, batch_size, distributed=
 
 def load_model(args, ngpus_per_node):
     # init model, ResNet18() can also be used for training here
+    global best_acc1
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
+    epoch = 0
     if args.arch == 'wideresnet':
         model = WideResNet(num_classes=200).cuda()
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        model = nn.Sequential(
+            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            model
+        )
     elif args.arch == 'resnet50':
-        model = resnet50(pretrained=True)
+        if args.checkpoint is not None:
+            if args.stat_dict is None or args.stat_dict == 'madry':
+                from robustness.model_utils import make_and_restore_model
+                from robustness.datasets import DATASETS
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                model, _ = make_and_restore_model(arch=args.arch,
+                                                  dataset=_dataset, resume_path=args.checkpoint)
+                model = model.model
+                model = nn.Sequential(
+                    Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    model
+                )
+                optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                      weight_decay=args.weight_decay)
+            elif args.stat_dict == 'gat':
+                model = nn.Sequential(
+                    Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    resnet50(pretrained=False)
+                )
+                optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                      weight_decay=args.weight_decay)
+                try:
+                    checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
+                    if isinstance(checkpoint, dict):
+                        model.load_state_dict(checkpoint['state_dict'])
+
+                        if 'optimizer_state_dict' in checkpoint:
+                            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        if 'epoch' in checkpoint:
+                            epoch = checkpoint['epoch'] + 1
+                        if 'best_acc1' in checkpoint:
+                            best_acc1 = checkpoint['best_acc1']
+
+                        print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
+                        print('best_accuracy --> ', best_acc1)
+
+                except RuntimeError as error:
+                    raise error  # type: ignore
+            else:
+                raise NotImplementedError()
+        else:
+            model = resnet50(pretrained=True)
+            model = nn.Sequential(
+                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                model
+            )
+            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                  weight_decay=args.weight_decay)
     else:
         print('Model architecture not specified.')
+        raise ValueError()
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
@@ -227,50 +296,7 @@ def load_model(args, ngpus_per_node):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    epoch = 0
-    best_acc1 = .0
-    if os.path.exists(args.model_path):
-        if 'pretrained_model' in args.model_path:
-            from robustness.model_utils import make_and_restore_model
-            from robustness.datasets import DATASETS
-            _dataset = DATASETS['cifar']('../data')
-            model, checkpoint = make_and_restore_model(arch=args.arch,
-                                                       dataset=_dataset, resume_path=args.model_path)
-            print('model successfully loaded.')
-            filename = os.path.join(args.model_dir, 'model-epoch0.pt')
-            torch.save({
-                'epoch': 0,
-                'model_state_dict': model.model.state_dict(),
-                'best_acc1': 0.0,
-            }, filename)
-        else:
-            try:
-                checkpoint = torch.load(args.model_path)  # , pickle_module=dill)
-                if isinstance(checkpoint, dict):
-                    if 'model' in checkpoint:
-                        model.load_state_dict(checkpoint['model'])
-                        print('model')
-                    elif 'model_state_dict' in checkpoint:
-                        model.load_state_dict(checkpoint['model_state_dict'])
-                    elif 'state_dict' in checkpoint:
-                        model.load_state_dict(checkpoint['state_dict'])
-
-                    if 'optimizer_state_dict' in checkpoint:
-                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    if 'epoch' in checkpoint:
-                        epoch = checkpoint['epoch'] + 1
-                    if 'best_acc1' in checkpoint:
-                        best_acc1 = checkpoint['best_acc1']
-
-                    print("=> loaded checkpoint '{}' (epoch {})".format(args.model_path, checkpoint['epoch']))
-                    print('best_accuracy --> ', best_acc1)
-
-            except RuntimeError as error:
-                raise error  # type: ignore
-    return model, epoch, optimizer, criterion, best_acc1
+    return model, epoch, optimizer, criterion
 
 
 def eval_train(model, train_loader, args):
@@ -341,7 +367,7 @@ def visualize_dataset(viz_dataset, viz_dataloader, _model=None):
     plt.show()
 
 
-def train_ep(args, model, train_loader, optimizer, criterion, epoch):
+def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, epoch):
     model.train()
 
     for batch_idx, (data, target) in enumerate(train_loader):
@@ -349,21 +375,25 @@ def train_ep(args, model, train_loader, optimizer, criterion, epoch):
 
         # zero gradient
         optimizer.zero_grad()
-        # calculate robust loss
-        logits = model(data)
-        loss = criterion(logits, target)
 
-        # loss, lost_nat, loss_adv = trades_loss(model=model,
-        #                                        x_natural=data,
-        #                                        y=target,
-        #                                        local_rank=local_rank,
-        #                                        optimizer=optimizer,
-        #                                        pgd_attack=pgd_attack,
-        #                                        step_size=args.step_size,
-        #                                        epsilon=args.epsilon,
-        #                                        perturb_steps=args.num_steps,
-        #                                        beta=args.beta,
-        #                                        distance=args.dist)
+        # clean training
+        if args.mode == 'natural':
+            logits = model(data)
+            loss = criterion(logits, target)
+
+        # adv training
+        elif args.mode == 'adv_train':
+            loss, lost_nat, loss_adv = trades_loss(model=model,
+                                                   x_natural=data,
+                                                   y=target,
+                                                   local_rank=args.rank,
+                                                   optimizer=optimizer,
+                                                   pgd_attack=pgd_attack,
+                                                   step_size=args.step_size,
+                                                   epsilon=args.epsilon,
+                                                   perturb_steps=args.num_steps,
+                                                   beta=args.beta,
+                                                   distance=args.dist)
 
         loss.backward()
         optimizer.step()
@@ -376,16 +406,19 @@ def train_ep(args, model, train_loader, optimizer, criterion, epoch):
                            100. * batch_idx / len(train_loader), loss.item()))
 
 
-def train(model, epoch, optimizer, criterion, best_acc1, train_loader, test_loader, args):
+def train(model, epoch, optimizer, criterion, train_loader, test_loader, args):
     test_loss, test_acc1 = eval_test(model, test_loader)
     print("Test Accuracy: {}%".format(test_acc1))
     exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
     liveloss = PlotLosses(outputs=[MatplotlibPlot(figpath="./result/imagenet_train_loss.png")])
 
-    for e in range(epoch, epoch + args.epochs):
+    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', attack_power=args.power,
+                                 start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
+                                 multiple_rand_start=True, order_schedule=args.order)
 
+    for e in range(epoch, epoch + args.epochs):
         # adversarial training
-        train_ep(args, model, train_loader, optimizer, criterion, e)
+        train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, e)
 
         exp_lr_scheduler.step()
         # evaluation on natural examples
