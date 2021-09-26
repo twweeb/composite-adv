@@ -296,3 +296,33 @@ def generate_attack_radar(enabled_attack, epsilon_setting):
     adv_val = [(adv_interval[1] - adv_interval[0])/2 for adv_interval in epsilon_setting]
     radar_value = [adv_val[i] if i in enabled_attack else 0 for i in range(6)]
     draw_radar_chart(values=radar_value, legend=show_enabled_attack(enabled_attack))
+
+
+def imshow(data, model, classes_map, ground_truth=None, save_file='print_grid.pdf', show=False):
+    figure = plt.figure(figsize=(8, 8))
+    cols, rows = 3, 3
+
+    model.eval()
+    output = model(data)
+    data_labels = output.max(1, keepdim=True)[1].cpu()
+    ground_truth = ground_truth.cpu() if ground_truth is not None else ground_truth
+
+    data = data.cpu()
+    for i in range(1, cols * rows + 1):
+        img, label = data[i], data_labels[i]
+        figure.add_subplot(rows, cols, i)
+        if ground_truth is not None:
+            plt.title(classes_map[label]+" ("+classes_map[ground_truth[i]]+")")
+        else:
+            plt.title(classes_map[label])
+        plt.axis("off")
+        npimg = np.transpose(img.squeeze().numpy(), (1, 2, 0))
+        plt.imshow(npimg)
+
+    plt.savefig(save_file)
+
+    if show:
+        plt.show()
+    print("Figure saved.")
+
+

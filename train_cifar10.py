@@ -9,15 +9,17 @@ import torch.multiprocessing as mp
 from torch.utils.data import SubsetRandomSampler, DataLoader
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import torchvision
 from torchvision import datasets, transforms
-from torch.autograd import Variable
 import numpy as np
 import random
 from models.wideresnet import *
 from generalized_order_attack.attacks import *
+from generalized_order_attack.utilities import imshow
 from models.resnet import *
 from robustness.cifar_models.resnet import *
-from trades import trades_loss
+from torch.autograd import Variable
+import matplotlib.pyplot as plt
 
 
 def list_type(s):
@@ -59,10 +61,10 @@ parser.add_argument('--model-dir', default='./model-cifar-wideResNet',
                     help='directory of model for saving checkpoint')
 parser.add_argument('--save-freq', '-s', default=1, type=int, metavar='N',
                     help='save frequency')
-parser.add_argument('--dist', default='comp', type=str,
-                    help='distance metric')
 parser.add_argument('--mode', default='natural', type=str,
                     help='specify training mode (natural or adv_train)')
+parser.add_argument('--debug', action='store_true',
+                    help='Train Only One Epoch and print training images.')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--checkpoint', type=str, default=None, help='path of checkpoint')
@@ -98,6 +100,8 @@ attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
 epoch = 0
 best_acc1 = .0
 no_improve = 0
+
+classes_map = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
 
 def main():
@@ -270,6 +274,10 @@ def load_model(args, ngpus_per_node):
                     print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
                     print('best_accuracy --> ', best_acc1)
                     print('No improve --> ', no_improve)
+                else:
+                    raise ValueError()
+            else:
+                raise ValueError()
 
         elif args.arch == 'resnet50':
             try:
@@ -324,29 +332,52 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
         # adv training normal
         elif args.mode == 'adv_train':
             model.eval()
-            x_adv = pgd_attack(data, target)
+            data_adv = pgd_attack(data, target)
             # x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
+            if args.debug:
+                imshow(data, model, classes_map,
+                       ground_truth=target, save_file='images/train/cifar10_adv_train (clean).pdf', show=False)
+                imshow(data_adv, model, classes_map,
+                       ground_truth=target, save_file='images/train/cifar10_adv_train (attack).pdf', show=False)
+                break
+
             model.train()
 
             # zero gradient
             optimizer.zero_grad()
-            logits = model(x_adv)
+            logits = model(data_adv)
             loss = criterion(logits, target)
 
         # adv training by trades
         elif args.mode == 'adv_train_trades':
             # TRADE Loss would require more memory.
-            loss, lost_nat, loss_adv = trades_loss(model=model,
-                                                   x_natural=data,
-                                                   y=target,
-                                                   local_rank=args.rank,
-                                                   optimizer=optimizer,
-                                                   pgd_attack=pgd_attack,
-                                                   step_size=args.step_size,
-                                                   epsilon=args.epsilon,
-                                                   perturb_steps=args.num_steps,
-                                                   beta=args.beta,
-                                                   distance=args.dist)
+            model.eval()
+            batch_size = len(data)
+            # generate adversarial example
+            if args.gpu is not None:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda(args.gpu, non_blocking=True).detach()
+            else:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
+
+            data_adv = pgd_attack(data_adv, target)
+            data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
+            if args.debug:
+                imshow(data, model, classes_map,
+                       ground_truth=target, save_file='images/train/cifar10_adv_train_trades (clean).pdf', show=False)
+                imshow(data_adv, model, classes_map,
+                       ground_truth=target, save_file='images/train/cifar10_adv_train_trades (attack).pdf', show=False)
+                break
+
+            model.train()
+            # zero gradient
+            optimizer.zero_grad()
+
+            # calculate robust loss
+            logits = model(data)
+            loss_natural = F.cross_entropy(logits, target)
+            loss_robust = (1.0 / batch_size) * F.kl_div(F.log_softmax(model(data_adv), dim=1),
+                                                        F.softmax(model(data), dim=1))
+            loss = loss_natural + args.beta * loss_robust
 
         else:
             print("Not Specify Training Mode.")
@@ -369,7 +400,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
         test_loss, test_acc1 = eval_test(model, test_loader, args)
         print("Test Accuracy: {}%".format(test_acc1))
 
-    pgd_attack = CompositeAttack(model, args.enable, mode='train', local_rank=args.rank,
+    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', local_rank=args.rank,
                                  attack_power=args.power, start_num=start_num, iter_num=iter_num,
                                  inner_iter_num=inner_iter_num, multiple_rand_start=True, order_schedule=args.order)
 
@@ -382,9 +413,10 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
 
         # adversarial training
         train_ep(args, model, train_loader, pgd_attack, optimizer, criterion)
+        if args.debug:
+            break
 
         # evaluation on natural examples
-        train_loss, train_acc1 = eval_train(model, train_loader, args)
         test_loss, test_acc1 = eval_test(model, test_loader, args)
 
         # remember best acc@1 and save checkpoint
@@ -418,7 +450,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
             print('================================================================')
             with open(args.log_filename, 'a+') as f:
                 csv_write = csv.writer(f)
-                data_row = [e, train_loss, train_acc1, test_loss, test_acc1, best_acc1]
+                data_row = [e, test_loss, test_acc1, best_acc1]
                 csv_write.writerow(data_row)
 
 
@@ -471,6 +503,35 @@ def eval_test(model, test_loader, args):
     return test_loss, test_accuracy
 
 
+def visualize_dataset(viz_dataset, viz_dataloader, model=None):
+    figure = plt.figure(figsize=(8, 8))
+    cols, rows = 3, 3
+    data_features, data_labels = next(iter(viz_dataloader))
+    if model is not None:
+        model.eval()
+        data_features_cuda = data_features.cuda()
+        output = model(data_features_cuda)
+        data_labels = output.max(1, keepdim=True)[1].cpu()
+
+    print(f"Feature batch shape: {data_features.size()}")
+    print(f"Labels batch shape: {data_labels.size()}")
+    # print(f"Labels: {data_labels}")
+
+    for i in range(1, cols * rows + 1):
+        img, label = data_features[i], data_labels[i]
+        figure.add_subplot(rows, cols, i)
+        plt.title(",".join(viz_dataset.nid_to_words[viz_dataset.ids[label]]))
+        plt.axis("off")
+        npimg = np.transpose(img.squeeze().numpy(), (1, 2, 0))
+        plt.imshow(npimg)
+
+    if model is not None:
+        plt.savefig('images/imagenet (model).pdf')
+    else:
+        plt.savefig('images/imagenet (ground_truth).pdf')
+    plt.show()
+
+
 def adjust_learning_rate(optimizer, args):
     """decrease the learning rate"""
     global epoch, no_improve
@@ -489,3 +550,4 @@ def adjust_learning_rate(optimizer, args):
 
 if __name__ == '__main__':
     main()
+    # visualize_dataset(testset, test_loader, _model=model)

@@ -19,6 +19,7 @@ class CompositeAttack(nn.Module):
         super().__init__()
         self.model = model
         self.local_rank = local_rank
+        self.device = 'cuda' if local_rank == -1 else 'cuda:'+str(local_rank)
         self.fixed_order = enabled_attack
         self.enabled_attack = tuple(sorted(enabled_attack))
         self.mode = mode
@@ -84,34 +85,34 @@ class CompositeAttack(nn.Module):
 
     def _setup_attack(self):
         if self.multiple_rand_start:
-            hue_space = torch.rand((self.start_num, self.batch_size), device='cuda') * (
+            hue_space = torch.rand((self.start_num, self.batch_size), device=self.device) * (
                     self.eps_pool[0][1] - self.eps_pool[0][0]) + self.eps_pool[0][0]
-            sat_space = torch.rand((self.start_num, self.batch_size), device='cuda') * (
+            sat_space = torch.rand((self.start_num, self.batch_size), device=self.device) * (
                     self.eps_pool[1][1] - self.eps_pool[1][0]) + self.eps_pool[1][0]
-            rot_space = torch.rand((self.start_num, self.batch_size), device='cuda') * (
+            rot_space = torch.rand((self.start_num, self.batch_size), device=self.device) * (
                     self.eps_pool[2][1] - self.eps_pool[2][0]) + self.eps_pool[2][0]
-            bright_space = torch.rand((self.start_num, self.batch_size), device='cuda') * (
+            bright_space = torch.rand((self.start_num, self.batch_size), device=self.device) * (
                     self.eps_pool[3][1] - self.eps_pool[3][0]) + self.eps_pool[3][0]
-            contrast_space = torch.rand((self.start_num, self.batch_size), device='cuda') * (
+            contrast_space = torch.rand((self.start_num, self.batch_size), device=self.device) * (
                     self.eps_pool[4][1] - self.eps_pool[4][0]) + self.eps_pool[4][0]
-            linf_space = torch.tensor([self.eps_pool[5][1] for _ in range(self.start_num)], device='cuda')
+            linf_space = torch.tensor([self.eps_pool[5][1] for _ in range(self.start_num)], device=self.device)
         else:
             hue_space = torch.tensor([[((2 * i + 1.) / self.start_num) * (
                     self.eps_pool[0][1] - self.eps_pool[0][0]) / 2 + self.eps_pool[0][0] for _ in
-                                       range(self.batch_size)] for i in range(self.start_num)], device='cuda')
+                                       range(self.batch_size)] for i in range(self.start_num)], device=self.device)
             sat_space = torch.tensor([[((2 * i + 1.) / self.start_num) * (
                     self.eps_pool[1][1] - self.eps_pool[1][0]) / 2 + self.eps_pool[1][0] for _ in
-                                       range(self.batch_size)] for i in range(self.start_num)], device='cuda')
+                                       range(self.batch_size)] for i in range(self.start_num)], device=self.device)
             rot_space = torch.tensor([[((2 * i + 1.) / self.start_num) * (
                     self.eps_pool[2][1] - self.eps_pool[2][0]) / 2 + self.eps_pool[2][0] for _ in
-                                       range(self.batch_size)] for i in range(self.start_num)], device='cuda')
+                                       range(self.batch_size)] for i in range(self.start_num)], device=self.device)
             bright_space = torch.tensor([[((2 * i + 1.) / self.start_num) * (
                     self.eps_pool[3][1] - self.eps_pool[3][0]) / 2 + self.eps_pool[3][0] for _ in
-                                          range(self.batch_size)] for i in range(self.start_num)], device='cuda')
+                                          range(self.batch_size)] for i in range(self.start_num)], device=self.device)
             contrast_space = torch.tensor([[((2 * i + 1.) / self.start_num) * (
                     self.eps_pool[4][1] - self.eps_pool[4][0]) / 2 + self.eps_pool[4][0] for _ in
-                                            range(self.batch_size)] for i in range(self.start_num)], device='cuda')
-            linf_space = torch.tensor([self.eps_pool[5][1] for _ in range(self.start_num)], device='cuda')
+                                            range(self.batch_size)] for i in range(self.start_num)], device=self.device)
+            linf_space = torch.tensor([self.eps_pool[5][1] for _ in range(self.start_num)], device=self.device)
 
         self.adv_val_pool = [hue_space, sat_space, rot_space, bright_space, contrast_space, linf_space]
         self.eps_space = [self.eps_pool[i] for i in self.enabled_attack]
@@ -150,7 +151,7 @@ class CompositeAttack(nn.Module):
         ori_data = data.clone()
         ori_is_attacked = self.is_attacked
 
-        new_data = kornia.adjust_hue(data, hue)
+        new_data = kornia.enhance.adjust_hue(data, hue)
         for i in range(self.inner_iter_num):
 
             outputs = self.model(new_data)
@@ -167,7 +168,7 @@ class CompositeAttack(nn.Module):
             hue_grad[self.is_attacked] = 0
             hue = torch.clamp(hue + torch.sign(hue_grad) * self.step_size_pool[0], self.eps_pool[0][0],
                               self.eps_pool[0][1]).detach().requires_grad_()
-            new_data = kornia.adjust_hue(data, hue)
+            new_data = kornia.enhance.adjust_hue(data, hue)
 
         new_data[ori_is_attacked] = ori_data[ori_is_attacked]
 
@@ -180,7 +181,7 @@ class CompositeAttack(nn.Module):
         ori_data = data.clone()
         ori_is_attacked = self.is_attacked
 
-        new_data = kornia.adjust_saturation(data, sat)
+        new_data = kornia.enhance.adjust_saturation(data, sat)
         for i in range(self.inner_iter_num):
             outputs = self.model(new_data)
             cur_pred = outputs.max(1, keepdim=True)[1].squeeze()
@@ -196,38 +197,20 @@ class CompositeAttack(nn.Module):
             sat_grad[self.is_attacked] = 0
             sat = torch.clamp(sat + torch.sign(sat_grad) * self.step_size_pool[1], self.eps_pool[1][0],
                               self.eps_pool[1][1]).detach().requires_grad_()
-            new_data = kornia.adjust_saturation(data, sat)
+            new_data = kornia.enhance.adjust_saturation(data, sat)
 
         new_data[ori_is_attacked] = ori_data[ori_is_attacked]
 
         return new_data, sat
 
     def eval_rot(self, data, theta, labels):
-        def kornia_rotate(imgs, degree):
-            if self.local_rank != -1:
-                angle = torch.ones(imgs.shape[0]).cuda(self.local_rank) * degree
-                center = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
-                center[..., 0] = imgs.shape[2] / 2  # x
-                center[..., 1] = imgs.shape[3] / 2  # y
-                scale = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
-            else:
-                angle = torch.ones(imgs.shape[0]).cuda() * degree
-                center = torch.ones(imgs.shape[0], 2).cuda()
-                center[..., 0] = imgs.shape[2] / 2  # x
-                center[..., 1] = imgs.shape[3] / 2  # y
-                scale = torch.ones(imgs.shape[0], 2).cuda()
-
-            M = kornia.get_rotation_matrix2d(center, angle, scale)
-            imgs_rotated = kornia.warp_affine(imgs, M, dsize=(imgs.shape[2], imgs.shape[3]))
-            return imgs_rotated
-
         theta = theta.detach()
         theta[self.is_attacked] = 0
         theta.requires_grad_()
         ori_data = data.clone()
         ori_is_attacked = self.is_attacked
 
-        new_data = kornia_rotate(data, theta)
+        new_data = kornia.geometry.transform.rotate(data, theta)
         for i in range(self.inner_iter_num):
             outputs = self.model(new_data)
             cur_pred = outputs.max(1, keepdim=True)[1].squeeze()
@@ -243,7 +226,7 @@ class CompositeAttack(nn.Module):
             theta_grad[self.is_attacked] = 0
             theta = torch.clamp(theta + torch.sign(theta_grad) * self.step_size_pool[2], self.eps_pool[2][0],
                                 self.eps_pool[2][1]).detach().requires_grad_()
-            new_data = kornia_rotate(data, theta)
+            new_data = kornia.geometry.transform.rotate(data, theta)
 
         new_data[ori_is_attacked] = ori_data[ori_is_attacked]
 
@@ -256,7 +239,7 @@ class CompositeAttack(nn.Module):
         ori_data = data.clone()
         ori_is_attacked = self.is_attacked
 
-        new_data = kornia.adjust_brightness(data, brightness)
+        new_data = kornia.enhance.adjust_brightness(data, brightness)
         for i in range(self.inner_iter_num):
             outputs = self.model(new_data)
             cur_pred = outputs.max(1, keepdim=True)[1].squeeze()
@@ -273,7 +256,7 @@ class CompositeAttack(nn.Module):
             brightness = torch.clamp(brightness + torch.sign(brightness_grad) * self.step_size_pool[3],
                                      self.eps_pool[3][0],
                                      self.eps_pool[3][1]).detach().requires_grad_()
-            new_data = kornia.adjust_brightness(data, brightness)
+            new_data = kornia.enhance.adjust_brightness(data, brightness)
 
         new_data[ori_is_attacked] = ori_data[ori_is_attacked]
 
@@ -286,7 +269,7 @@ class CompositeAttack(nn.Module):
         ori_data = data.clone()
         ori_is_attacked = self.is_attacked
 
-        new_data = kornia.adjust_contrast(data, contrast)
+        new_data = kornia.enhance.adjust_contrast(data, contrast)
         for i in range(self.inner_iter_num):
 
             outputs = self.model(new_data)
@@ -303,7 +286,7 @@ class CompositeAttack(nn.Module):
             contrast_grad[self.is_attacked] = 0
             contrast = torch.clamp(contrast + torch.sign(contrast_grad) * self.step_size_pool[4], self.eps_pool[4][0],
                                    self.eps_pool[4][1]).detach().requires_grad_()
-            new_data = kornia.adjust_contrast(data, contrast)
+            new_data = kornia.enhance.adjust_contrast(data, contrast)
 
         new_data[ori_is_attacked] = ori_data[ori_is_attacked]
 
@@ -335,10 +318,11 @@ class CompositeAttack(nn.Module):
     def train_hue(self, data, hue, labels):
         hue = hue.detach().requires_grad_()
 
-        new_data = kornia.adjust_hue(data, hue)
+        new_data = kornia.enhance.adjust_hue(data, hue)
+        if self.mode == 'fast_train':
+            return new_data, hue
+
         for i in range(self.inner_iter_num):
-            if self.mode == 'fast_train':
-                break
             outputs = self.model(new_data)
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
@@ -348,22 +332,19 @@ class CompositeAttack(nn.Module):
                 hue_grad = torch.autograd.grad(cost, hue, retain_graph=False)[0]
             hue = torch.clamp(hue + torch.sign(hue_grad) * self.step_size_pool[0], self.eps_pool[0][0],
                               self.eps_pool[0][1]).detach().requires_grad_()
-            new_data = kornia.adjust_hue(data, hue)
+            new_data = kornia.enhance.adjust_hue(data, hue)
 
         return new_data, hue
 
     def train_sat(self, data, sat, labels):
         sat = sat.detach().requires_grad_()
 
-        new_data = kornia.adjust_saturation(data, sat)
+        new_data = kornia.enhance.adjust_saturation(data, sat)
+        if self.mode == 'fast_train':
+            return new_data, sat
+
         for i in range(self.inner_iter_num):
-            if self.mode == 'fast_train':
-                break
             outputs = self.model(new_data)
-            # cur_pred = outputs.max(1, keepdim=True)[1]
-            # if cur_pred.item() != labels.item():
-            #     self.is_attacked = True
-            #     break
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
@@ -372,39 +353,19 @@ class CompositeAttack(nn.Module):
                 sat_grad = torch.autograd.grad(cost, sat, retain_graph=False)[0]
             sat = torch.clamp(sat + torch.sign(sat_grad) * self.step_size_pool[1], self.eps_pool[1][0],
                               self.eps_pool[1][1]).detach().requires_grad_()
-            new_data = kornia.adjust_saturation(data, sat)
+            new_data = kornia.enhance.adjust_saturation(data, sat)
 
         return new_data, sat
 
     def train_rot(self, data, theta, labels):
         theta = theta.detach().requires_grad_()
 
-        def kornia_rotate(imgs, degree):
-            if self.local_rank != -1:
-                angle = torch.ones(imgs.shape[0]).cuda(self.local_rank) * degree
-                center = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
-                center[..., 0] = imgs.shape[2] / 2  # x
-                center[..., 1] = imgs.shape[3] / 2  # y
-                scale = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
-            else:
-                angle = torch.ones(imgs.shape[0]).cuda() * degree
-                center = torch.ones(imgs.shape[0], 2).cuda()
-                center[..., 0] = imgs.shape[2] / 2  # x
-                center[..., 1] = imgs.shape[3] / 2  # y
-                scale = torch.ones(imgs.shape[0], 2).cuda()
-            M = kornia.get_rotation_matrix2d(center, angle, scale)
-            imgs_rotated = kornia.warp_affine(imgs, M, dsize=(imgs.shape[2], imgs.shape[3]))
-            return imgs_rotated
+        new_data = kornia.geometry.transform.rotate(data, theta)
+        if self.mode == 'fast_train':
+            return new_data, theta
 
-        new_data = kornia_rotate(data, theta)
         for i in range(self.inner_iter_num):
-            if self.mode == 'fast_train':
-                break
             outputs = self.model(new_data)
-            # cur_pred = outputs.max(1, keepdim=True)[1]
-            # if cur_pred.item() != labels.item():
-            #     self.is_attacked = True
-            #     break
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
@@ -413,22 +374,19 @@ class CompositeAttack(nn.Module):
                 theta_grad = torch.autograd.grad(cost, theta, retain_graph=False)[0]
             theta = torch.clamp(theta + torch.sign(theta_grad) * self.step_size_pool[2], self.eps_pool[2][0],
                                 self.eps_pool[2][1]).detach().requires_grad_()
-            new_data = kornia_rotate(data, theta)
+            new_data = kornia.geometry.transform.rotate(data, theta)
 
         return new_data, theta
 
     def train_bright(self, data, brightness, labels):
         brightness = brightness.detach().requires_grad_()
 
-        new_data = kornia.adjust_brightness(data, brightness)
+        new_data = kornia.enhance.adjust_brightness(data, brightness)
+        if self.mode == 'fast_train':
+            return new_data, brightness
+
         for i in range(self.inner_iter_num):
-            if self.mode == 'fast_train':
-                break
             outputs = self.model(new_data)
-            # cur_pred = outputs.max(1, keepdim=True)[1]
-            # if cur_pred.item() != labels.item():
-            #     self.is_attacked = True
-            #     break
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
@@ -438,22 +396,19 @@ class CompositeAttack(nn.Module):
             brightness = torch.clamp(brightness + torch.sign(brightness_grad) * self.step_size_pool[3],
                                      self.eps_pool[3][0],
                                      self.eps_pool[3][1]).detach().requires_grad_()
-            new_data = kornia.adjust_brightness(data, brightness)
+            new_data = kornia.enhance.adjust_brightness(data, brightness)
 
         return new_data, brightness
 
     def train_contrast(self, data, contrast, labels):
         contrast = contrast.detach().requires_grad_()
 
-        new_data = kornia.adjust_contrast(data, contrast)
+        new_data = kornia.enhance.adjust_contrast(data, contrast)
+        if self.mode == 'fast_train':
+            return new_data, contrast
+
         for i in range(self.inner_iter_num):
-            if self.mode == 'fast_train':
-                break
             outputs = self.model(new_data)
-            # cur_pred = outputs.max(1, keepdim=True)[1]
-            # if cur_pred.item() != labels.item():
-            #     self.is_attacked = True
-            #     break
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
@@ -462,12 +417,13 @@ class CompositeAttack(nn.Module):
                 contrast_grad = torch.autograd.grad(cost, contrast, retain_graph=False)[0]
             contrast = torch.clamp(contrast + torch.sign(contrast_grad) * self.step_size_pool[4], self.eps_pool[4][0],
                                    self.eps_pool[4][1]).detach().requires_grad_()
-            new_data = kornia.adjust_contrast(data, contrast)
+            new_data = kornia.enhance.adjust_contrast(data, contrast)
 
         return new_data, contrast
 
     def train_linf(self, data, labels):
         ori_data = data.detach()
+
         for i in range(self.inner_iter_num):
             outputs = self.model(data)
             self.model.zero_grad()

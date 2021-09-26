@@ -6,6 +6,7 @@ import shutil
 import csv
 import dill
 import builtins
+from typing import List
 import torch.multiprocessing as mp
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -33,6 +34,8 @@ def list_type(s):
 
 parser = argparse.ArgumentParser(description='PyTorch Tiny ImageNet Natural Training')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
+                    help='input batch size for training (default: 128)')
+parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train')
@@ -185,7 +188,7 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=args.workers,
                                                       batch_size=args.batch_size, distributed=args.distributed)
     test_loader, _ = generate_dataloader(VALID_DIR, "val", transform_test, workers=args.workers,
-                                         batch_size=args.batch_size)
+                                         batch_size=args.test_batch_size)
 
     train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node)
 
@@ -426,6 +429,7 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
 
         # adv training normal
         elif args.mode == 'adv_train':
+
             model.eval()
             x_adv = pgd_attack(data, target)
             model.train()
@@ -467,16 +471,13 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
 
 def train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node):
     global best_acc1, epoch
-
-    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                and args.rank % ngpus_per_node == 0):
-        if best_acc1 == 0.0:
-            test_loss, test_acc1 = eval_test(model, test_loader, args)
-            print("Test Accuracy: {}%".format(test_acc1))
+    if best_acc1 == 0.0:
+        test_loss, test_acc1 = eval_test(model, test_loader, args)
+        print("Test Accuracy: {}%".format(test_acc1))
 
     exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
 
-    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', attack_power=args.power,
+    pgd_attack = CompositeAttack(model, args.enable, mode='train', attack_power=args.power,
                                  start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
                                  multiple_rand_start=True, order_schedule=args.order)
 
@@ -488,14 +489,14 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
         train_ep(args, model, train_loader, pgd_attack, optimizer, criterion)
 
         exp_lr_scheduler.step()
+        test_loss, test_acc1 = eval_test(model, test_loader, args)
+
+        # remember best acc@1 and save checkpoint
+        is_best = test_acc1 > best_acc1
+        best_acc1 = max(test_acc1, best_acc1)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            test_loss, test_acc1 = eval_test(model, test_loader, args)
-
-            # remember best acc@1 and save checkpoint
-            is_best = test_acc1 > best_acc1
-            best_acc1 = max(test_acc1, best_acc1)
             # save checkpoint
             print("Best Test Accuracy: {}%".format(best_acc1))
 
