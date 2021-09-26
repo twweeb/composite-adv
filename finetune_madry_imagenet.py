@@ -2,7 +2,10 @@ from __future__ import print_function
 import os
 import warnings
 import argparse
+import shutil
 import csv
+import dill
+import builtins
 import torch.multiprocessing as mp
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -31,8 +34,6 @@ def list_type(s):
 parser = argparse.ArgumentParser(description='PyTorch Tiny ImageNet Natural Training')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for testing (default: 128)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train')
 parser.add_argument('--weight-decay', '--wd', default=2e-4,
@@ -65,14 +66,17 @@ parser.add_argument('--dist', default='comp', type=str,
                     help='distance metric')
 parser.add_argument('--mode', default='natural', type=str,
                     help='specify training mode (natural or adv_train)')
-parser.add_argument('--order', default='random', type=str, help='specify the order')
 parser.add_argument('--checkpoint', type=str, default=None, help='path of checkpoint')
+parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed training')
+parser.add_argument('--order', default='random', type=str, help='specify the order')
 parser.add_argument('--stat-dict', type=str, default=None,
                     help='key of stat dict in checkpoint')
 parser.add_argument("--enable", type=list_type, default=(0, 1), help="list of enabled attacks")
 parser.add_argument("--power", type=str, default='strong', help="level of attack power")
 parser.add_argument("--linf_loss", type=str, default='ce', help="loss for linf-attack, ce or kl")
 parser.add_argument("--log_filename", default='logfile.csv', help="filename of output log")
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
 parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
@@ -95,7 +99,8 @@ class Normalize(nn.Module):
         return self.normalize(input_tensor)
 
 
-best_acc1 = 0
+epoch = 0
+best_acc1 = .0
 
 start_num = 1
 iter_num = 1
@@ -108,6 +113,9 @@ attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
 def main():
     # settings
     args = parser.parse_args()
+
+    if not os.path.exists(args.model_dir):
+        os.makedirs(args.model_dir)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -134,11 +142,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1
     args.gpu = gpu
-
-    if not os.path.exists(args.model_dir):
-        os.makedirs(args.model_dir)
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -153,7 +157,12 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    model, epoch, optimizer, criterion = load_model(args, ngpus_per_node)
+    if args.multiprocessing_distributed and args.rank % ngpus_per_node != 0:
+        def print_pass(*args):
+            pass
+        builtins.print = print_pass
+
+    model, optimizer, criterion = load_model(args, ngpus_per_node)
     cudnn.benchmark = True
 
     # setup data loader
@@ -173,11 +182,12 @@ def main_worker(gpu, ngpus_per_node, args):
     TRAIN_DIR = os.path.join(DATA_DIR, 'train')
     VALID_DIR = os.path.join(DATA_DIR, 'val')
 
-    train_loader = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=ngpus_per_node * 4,
-                                       batch_size=args.batch_size, distributed=args.distributed)
-    test_loader = generate_dataloader(VALID_DIR, "val", transform_test, workers=ngpus_per_node * 4,
-                                      batch_size=args.test_batch_size)
-    train(model, epoch, optimizer, criterion, train_loader, test_loader, args)
+    train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=args.workers,
+                                                      batch_size=args.batch_size, distributed=args.distributed)
+    test_loader, _ = generate_dataloader(VALID_DIR, "val", transform_test, workers=args.workers,
+                                         batch_size=args.batch_size)
+
+    train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node)
 
 
 def generate_dataloader(data, name, transform, workers, batch_size, distributed=False):
@@ -204,7 +214,7 @@ def generate_dataloader(data, name, transform, workers, batch_size, distributed=
                             pin_memory=True,
                             sampler=train_sampler)
 
-    return dataloader
+    return dataloader, train_sampler
 
 
 def load_model(args, ngpus_per_node):
@@ -223,39 +233,62 @@ def load_model(args, ngpus_per_node):
     elif args.arch == 'resnet50':
         if args.checkpoint is not None:
             if args.stat_dict is None or args.stat_dict == 'madry':
-                from robustness.model_utils import make_and_restore_model
                 from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
                 _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
-                model, _ = make_and_restore_model(arch=args.arch,
-                                                  dataset=_dataset, resume_path=args.checkpoint)
-                model = model.model
+                model = _dataset.get_model(args.arch, False)
+                model = AttackerModel(model, _dataset)
+
+                if args.checkpoint and os.path.isfile(args.checkpoint):
+                    print("=> loading checkpoint '{}'".format(args.checkpoint))
+                    checkpoint = torch.load(args.checkpoint, pickle_module=dill)
+
+                    # Makes us able to load models saved with legacy versions
+                    state_dict_path = 'model'
+                    if not ('model' in checkpoint):
+                        state_dict_path = 'state_dict'
+
+                    sd = checkpoint[state_dict_path]
+                    sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                elif args.checkpoint:
+                    error_msg = "=> no checkpoint found at '{}'".format(args.checkpoint)
+                    raise ValueError(error_msg)
+
                 model = nn.Sequential(
                     Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                    model
+                    model.model
                 )
                 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
                                       weight_decay=args.weight_decay)
             elif args.stat_dict == 'gat':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                model = _dataset.get_model(args.arch, False)
+                model = AttackerModel(model, _dataset)
                 model = nn.Sequential(
                     Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                    resnet50(pretrained=False)
+                    model.model
                 )
-                optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
-                                      weight_decay=args.weight_decay)
                 try:
                     checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
-                    if isinstance(checkpoint, dict):
-                        model.load_state_dict(checkpoint['state_dict'])
+                    assert isinstance(checkpoint, dict)
+                    sd = checkpoint['model_state_dict']
+                    sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+                    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                          weight_decay=args.weight_decay)
+                    if 'optimizer_state_dict' in checkpoint:
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    if 'epoch' in checkpoint:
+                        epoch = checkpoint['epoch'] + 1
+                    if 'best_acc1' in checkpoint:
+                        best_acc1 = checkpoint['best_acc1']
 
-                        if 'optimizer_state_dict' in checkpoint:
-                            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        if 'epoch' in checkpoint:
-                            epoch = checkpoint['epoch'] + 1
-                        if 'best_acc1' in checkpoint:
-                            best_acc1 = checkpoint['best_acc1']
-
-                        print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
-                        print('best_accuracy --> ', best_acc1)
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
+                    print('best_accuracy --> ', best_acc1)
 
                 except RuntimeError as error:
                     raise error  # type: ignore
@@ -273,6 +306,7 @@ def load_model(args, ngpus_per_node):
         print('Model architecture not specified.')
         raise ValueError()
 
+    # Send to GPU
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -296,7 +330,7 @@ def load_model(args, ngpus_per_node):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
-    return model, epoch, optimizer, criterion
+    return model, optimizer, criterion
 
 
 def eval_train(model, train_loader, args):
@@ -305,9 +339,12 @@ def eval_train(model, train_loader, args):
     correct = 0
     with torch.no_grad():
         for data, target in train_loader:
-            data, target = data.cuda(), target.cuda()
+            if args.gpu is not None:
+                data, target = data.cuda(args.gpu, non_blocking=True), target.cuda(args.gpu, non_blocking=True)
+            elif torch.cuda.is_available():
+                data, target = data.cuda(), target.cuda()
             output = model(data)
-            train_loss += F.cross_entropy(output, target, size_average=False).item()
+            train_loss += F.cross_entropy(output, target).item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
     train_loss /= len(train_loader.dataset)
@@ -318,15 +355,18 @@ def eval_train(model, train_loader, args):
     return train_loss, training_accuracy
 
 
-def eval_test(model, test_loader):
+def eval_test(model, test_loader, args):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
-            data, target = data.cuda(), target.cuda()
+            if args.gpu is not None:
+                data, target = data.cuda(args.gpu, non_blocking=True), target.cuda(args.gpu, non_blocking=True)
+            elif torch.cuda.is_available():
+                data, target = data.cuda(), target.cuda()
             output = model(data)
-            test_loss += F.cross_entropy(output, target, size_average=False).item()
+            test_loss += F.cross_entropy(output, target).item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
     test_loss /= len(test_loader.dataset)
@@ -367,22 +407,37 @@ def visualize_dataset(viz_dataset, viz_dataloader, _model=None):
     plt.show()
 
 
-def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, epoch):
+def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
+    global epoch
     model.train()
 
     for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.cuda(), target.cuda()
-
-        # zero gradient
-        optimizer.zero_grad()
+        if args.gpu is not None:
+            data, target = data.cuda(args.gpu, non_blocking=True), target.cuda(args.gpu, non_blocking=True)
+        elif torch.cuda.is_available():
+            data, target = data.cuda(), target.cuda()
 
         # clean training
         if args.mode == 'natural':
+            # zero gradient
+            optimizer.zero_grad()
             logits = model(data)
             loss = criterion(logits, target)
 
-        # adv training
+        # adv training normal
         elif args.mode == 'adv_train':
+            model.eval()
+            x_adv = pgd_attack(data, target)
+            model.train()
+
+            # zero gradient
+            optimizer.zero_grad()
+            logits = model(x_adv)
+            loss = criterion(logits, target)
+
+        # adv training by trades
+        elif args.mode == 'adv_train_trades':
+            # TRADE Loss would require more memory.
             loss, lost_nat, loss_adv = trades_loss(model=model,
                                                    x_natural=data,
                                                    y=target,
@@ -395,6 +450,10 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, epoch)
                                                    beta=args.beta,
                                                    distance=args.dist)
 
+        else:
+            print("Not Specify Training Mode.")
+            raise ValueError()
+
         loss.backward()
         optimizer.step()
 
@@ -403,65 +462,60 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, epoch)
             print(
                 'Train Epoch: {} [{}/{} ({:.0f}%)]\t Loss: {:.6f}'.format(
                     epoch, batch_idx * len(data), len(train_loader) * args.batch_size,
-                           100. * batch_idx / len(train_loader), loss.item()))
+                    100. * batch_idx / len(train_loader), loss.item()))
 
 
-def train(model, epoch, optimizer, criterion, train_loader, test_loader, args):
-    test_loss, test_acc1 = eval_test(model, test_loader)
-    print("Test Accuracy: {}%".format(test_acc1))
+def train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node):
+    global best_acc1, epoch
+
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                and args.rank % ngpus_per_node == 0):
+        if best_acc1 == 0.0:
+            test_loss, test_acc1 = eval_test(model, test_loader, args)
+            print("Test Accuracy: {}%".format(test_acc1))
+
     exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-    liveloss = PlotLosses(outputs=[MatplotlibPlot(figpath="./result/imagenet_train_loss.png")])
 
     pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', attack_power=args.power,
                                  start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
                                  multiple_rand_start=True, order_schedule=args.order)
 
     for e in range(epoch, epoch + args.epochs):
+        epoch = e
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
         # adversarial training
-        train_ep(args, model, train_loader, pgd_attack, optimizer, criterion, e)
+        train_ep(args, model, train_loader, pgd_attack, optimizer, criterion)
 
         exp_lr_scheduler.step()
-        # evaluation on natural examples
-        train_loss, train_acc1 = eval_train(model, train_loader, args)
-        test_loss, test_acc1 = eval_test(model, test_loader)
 
-        # remember best acc@1 and save checkpoint
-        is_best = test_acc1 > best_acc1
-        best_acc1 = max(test_acc1, best_acc1)
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                    and args.rank % ngpus_per_node == 0):
+            test_loss, test_acc1 = eval_test(model, test_loader, args)
 
-        # save checkpoint
-        print("Best Test Accuracy: {}%".format(best_acc1))
+            # remember best acc@1 and save checkpoint
+            is_best = test_acc1 > best_acc1
+            best_acc1 = max(test_acc1, best_acc1)
+            # save checkpoint
+            print("Best Test Accuracy: {}%".format(best_acc1))
 
-        filename = os.path.join(args.model_dir, 'model-epoch{}.pt'.format(e))
-        torch.save({
-            'epoch': e,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'best_acc1': best_acc1,
-        }, filename)
-        # print('Save model: {}'.format(os.path.join(model_dir, 'model-epoch{}.pt'.format(e))))
-        if is_best:
-            print("Save best model (epoch {})!".format(e))
-            # shutil.copyfile(filename, os.path.join(model_dir, 'model_best.pth'))
-            print('Save model: {}'.format(os.path.join(args.model_dir, 'model_best.pth')))
-        print('================================================================')
-        with open(args.log_filename, 'a+') as f:
-            csv_write = csv.writer(f)
-            # data_row = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch_start)), epoch_end - epoch_start]
-            data_row = [e, train_loss, train_acc1, test_loss, test_acc1, best_acc1]
-            csv_write.writerow(data_row)
-            # torch.save(model.state_dict(),
-            #            os.path.join(model_dir, 'model-wideres-epoch{}.pt'.format(epoch)))
-            # torch.save(optimizer.state_dict(),
-            #            os.path.join(model_dir, 'opt-wideres-checkpoint_epoch{}.tar'.format(epoch)))
-        liveloss.update({
-            'log loss': train_loss,
-            'val_log loss': test_loss,
-            'accuracy': train_acc1,
-            'val_accuracy': test_acc1
-        })
-
-        liveloss.send()
+            filename = os.path.join(args.model_dir, 'model-epoch{}.pt'.format(e))
+            torch.save({
+                'epoch': e,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_acc1': best_acc1,
+            }, filename)
+            # print('Save model: {}'.format(os.path.join(model_dir, 'model-epoch{}.pt'.format(e))))
+            if is_best:
+                print("Save best model (epoch {})!".format(e))
+                shutil.copyfile(filename, os.path.join(args.model_dir, 'model_best.pth'))
+                print('Save model: {}'.format(os.path.join(args.model_dir, 'model_best.pth')))
+            print('================================================================')
+            with open(args.log_filename, 'a+') as f:
+                csv_write = csv.writer(f)
+                data_row = [e, test_loss, test_acc1, best_acc1]
+                csv_write.writerow(data_row)
 
 
 if __name__ == '__main__':

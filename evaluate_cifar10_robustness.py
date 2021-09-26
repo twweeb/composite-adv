@@ -2,10 +2,16 @@ from typing import Dict, List
 import torch
 import csv
 import argparse
-
-from generalized_order_attack.utilities import add_dataset_model_arguments, \
-    get_dataset_model, generate_attack_radar
+import os
 from generalized_order_attack.attacks import *
+import torch.multiprocessing as mp
+from torch.utils.data import SubsetRandomSampler, DataLoader
+import torch.distributed as dist
+import torch.backends.cudnn as cudnn
+from torchvision import datasets, transforms
+from models.wideresnet import *
+from models.resnet import *
+import torch.nn.parallel
 import time
 import numpy as np
 import random
@@ -19,56 +25,246 @@ def list_type(s):
     return tuple(sorted(map(int, s.split(','))))
 
 
-def arg_parsing():
-    parser = argparse.ArgumentParser(
-        description='Model Robustness Evaluation')
-    parser.add_argument('attacks', metavar='attack', type=str, nargs='+',
-                        help='attack names')
+parser = argparse.ArgumentParser(
+    description='Model Robustness Evaluation')
+parser.add_argument('attacks', metavar='attack', type=str, nargs='+',
+                    help='attack names')
 
-    add_dataset_model_arguments(parser, include_checkpoint=True)
-    parser.add_argument("--cuda_id", type=str, default="0",
-                        help="specify GPU")
-    parser.add_argument('--batch_size', type=int, default=100,
-                        help='number of examples/minibatch')
-    parser.add_argument('--parallel', type=int, default=1,
-                        help='number of GPUs to train on')
-    parser.add_argument('--num_batches', type=int, required=False,
-                        help='number of batches (default entire dataset)')
-    parser.add_argument('--per_example', action='store_true', default=False,
-                        help='output per-example accuracy')
-    parser.add_argument('--message', type=str, default="",
-                        help='csv message before result')
-    parser.add_argument('--seed', type=int, default=0, help='RNG seed')
+parser.add_argument('--checkpoint', type=str, default=None, help='path of checkpoint')
+parser.add_argument('--stat-dict', type=str, default=None,
+                    help='key of stat dict in checkpoint')
+parser.add_argument('--arch', type=str, default='resnet50',
+                    help='model architecture')
+parser.add_argument('--dataset', type=str, default='cifar',
+                    help='dataset name')
+parser.add_argument('--dataset_path', type=str, default='../data',
+                    help='path to datasets directory')
+parser.add_argument('--batch_size', type=int, default=100,
+                    help='number of examples/minibatch')
+parser.add_argument('--parallel', type=int, default=1,
+                    help='number of GPUs to train on')
+parser.add_argument('--num_batches', type=int, required=False,
+                    help='number of batches (default entire dataset)')
+parser.add_argument('--per_example', action='store_true', default=False,
+                    help='output per-example accuracy')
+parser.add_argument('--message', type=str, default="",
+                    help='csv message before result')
+parser.add_argument('--seed', type=int, default=0, help='RNG seed')
 
-    parser.add_argument('--output', type=str, help='output CSV')
-    args_pool = parser.parse_args()
-    return args_pool
+parser.add_argument('--output', type=str, help='output CSV')
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
+parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
+parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
+parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
+parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
+parser.add_argument('--multiprocessing-distributed', action='store_true',
+                    help='Use multi-processing distributed training to launch '
+                         'N processes per node, which has N GPUs. This is the '
+                         'fastest way to use PyTorch for either single node or '
+                         'multi node data parallel training')
 
 
-if __name__ == '__main__':
-    args = arg_parsing()
+def main():
+    # settings
+    args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        cudnn.deterministic = True
+        warnings.warn('You have chosen to seed training. '
+                      'This will turn on the CUDNN deterministic setting, '
+                      'which can slow down your training considerably! '
+                      'You may see unexpected behavior when restarting '
+                      'from checkpoints.')
 
-    dataset, model = get_dataset_model(args, dataset_path='../data', dataset_name='cifar')
-    _, val_loader = dataset.make_loaders(workers=4, batch_size=args.batch_size, only_val=True,
-                                         shuffle_val=False)
+    if args.gpu is not None:
+        warnings.warn('You have chosen a specific GPU. This will completely '
+                      'disable data parallelism.')
 
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    ngpus_per_node = torch.cuda.device_count()
+    if args.multiprocessing_distributed:
+        args.world_size = ngpus_per_node * args.world_size
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    else:
+        # Simply call main_worker function
+        main_worker(args.gpu, ngpus_per_node, args)
+
+
+def main_worker(gpu, ngpus_per_node, args):
+    args.gpu = gpu
+
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
+
+    if args.distributed:
+        if args.dist_url == "env://" and args.rank == -1:
+            args.rank = int(os.environ["RANK"])
+        if args.multiprocessing_distributed:
+            # For multiprocessing distributed training, rank needs to be the
+            # global rank among all the processes
+            args.rank = args.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+
+    # if args.multiprocessing_distributed and args.rank % ngpus_per_node != 0:
+    #     def print_pass(*args):
+    #         pass
+    #     builtins.print = print_pass
+
+    model = load_model(args, ngpus_per_node)
+    cudnn.benchmark = True
+
+    # setup data loader
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    test_loader, _ = generate_dataloader('../data', "val", transform_test, workers=args.workers,
+                                         batch_size=args.batch_size)
+
+    evaluate(model, test_loader, ngpus_per_node, args)
+
+
+def generate_dataloader(data, name, transform, workers, batch_size, distributed=False):
+    if data is None:
+        return None
+
+    if transform is None:
+        dataset = datasets.CIFAR10(root=data, train=(name == "train"), download=True,
+                                   transform=transforms.ToTensor())
+    else:
+        dataset = datasets.CIFAR10(root=data, train=(name == "train"), download=True,
+                                   transform=transform)
+
+    if name == "train":
+        if distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        else:
+            indices = list(np.random.randint(0, len(dataset), int(len(dataset))))
+            train_sampler = SubsetRandomSampler(indices)
+    else:
+        train_sampler = None
+
+    # Wrap image dataset (defined above) in dataloader
+    dataloader = DataLoader(dataset, batch_size=batch_size,
+                            shuffle=(train_sampler is None),
+                            num_workers=workers,
+                            pin_memory=True,
+                            sampler=train_sampler)
+
+    return dataloader, train_sampler
+
+
+def load_model(args, ngpus_per_node):
+    # Given Architecture
+    if args.arch == 'wideresnet':
+        model = WideResNet()
+    elif args.arch == 'resnet50':
+        model = ResNet50()
+    else:
+        print('Model architecture not specified.')
+        raise ValueError()
+
+    # Send to GPU
+    if not torch.cuda.is_available():
+        print('using CPU, this will be slow')
+    elif args.distributed:
+        if args.gpu is not None:
+            torch.cuda.set_device(args.gpu)
+            model.cuda(args.gpu)
+            args.batch_size = int(args.batch_size / ngpus_per_node)
+            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        else:
+            model.cuda()
+            model = torch.nn.parallel.DistributedDataParallel(model)
+    elif args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        model = model.cuda(args.gpu)
+    else:
+        # DataParallel will divide and allocate batch_size to all available GPUs
+        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+            model.features = torch.nn.DataParallel(model.features)
+            model.cuda()
+        else:
+            model = torch.nn.DataParallel(model).cuda()
+
+    if os.path.exists(args.checkpoint):
+        if args.arch == 'wideresnet':
+            checkpoint = torch.load(args.checkpoint)
+            if args.stat_dict == 'trades':
+                sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
+                model.load_state_dict(sd)
+            elif args.stat_dict == 'gat':
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        sd = checkpoint['model_state_dict']
+                        # sd = {k[len('module.'):]: v for k, v in sd.items()}  # Use this if missing key matching
+                        model.load_state_dict(sd)
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+
+        elif args.arch == 'resnet50':
+            try:
+                checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
+                if isinstance(checkpoint, dict):
+                    if 'model' in checkpoint:
+                        model.load_state_dict(checkpoint['model'])
+                        print('model')
+                    elif 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+
+            except RuntimeError as error:
+                raise error  # type: ignore
+
+    return model
+
+
+def evaluate(model, val_loader, ngpus_per_node, args):
     model.eval()
     print('Cuda available:', torch.cuda.is_available())
     if torch.cuda.is_available():
         model.cuda()
 
     attack_names: List[str] = args.attacks
-    attacks = [eval(attack_name) for attack_name in attack_names]
+    attacks = []
+    for attack_name in attack_names:
+        tmp = eval(attack_name)
+        attacks.append(tmp)
 
-    # Parallelize
-    if torch.cuda.is_available():
-        device_ids = list(range(args.parallel))
-        model = nn.DataParallel(model, device_ids)
-        attacks = [nn.DataParallel(attack, device_ids) for attack in attacks]
+    if not torch.cuda.is_available():
+        print('using CPU, this will be slow')
+    elif args.distributed:
+        if args.gpu is not None:
+            torch.cuda.set_device(args.gpu)
+            model.cuda(args.gpu)
+            args.batch_size = int(args.batch_size / ngpus_per_node)
+            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            attacks = [torch.nn.parallel.DistributedDataParallel(attack, device_ids=[args.gpu]) for attack in attacks]
+        else:
+            model.cuda()
+            model = torch.nn.parallel.DistributedDataParallel(model)
+            attacks = [torch.nn.parallel.DistributedDataParallel(attack) for attack in attacks]
+    elif args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        model = model.cuda(args.gpu)
+        attacks = [attack.cuda(args.gpu) for attack in attacks]
+    else:
+        model = torch.nn.DataParallel(model).cuda()
+        attacks = [torch.nn.DataParallel(attack).cuda() for attack in attacks]
 
     batches_correct: Dict[str, List[torch.Tensor]] = \
         {attack_name: [] for attack_name in attack_names}
@@ -136,7 +332,7 @@ if __name__ == '__main__':
     with open(args.output, 'a+') as out_file:
         out_csv = csv.writer(out_file)
         out_csv.writerow([args.message])
-        out_csv.writerow(['attack_setting']+attack_names)
+        out_csv.writerow(['attack_setting'] + attack_names)
         if args.per_example:
             for example_correct in zip(*[
                 attacks_correct[attack_name] for attack_name in attack_names
@@ -144,9 +340,13 @@ if __name__ == '__main__':
                 out_csv.writerow(
                     [int(attack_correct.item()) for attack_correct
                      in example_correct])
-        out_csv.writerow(['accuracies']+accuracies)
-        out_csv.writerow(['attack_success_rates']+attack_success_rates)
-        out_csv.writerow(['time_usage']+total_time_used)
+        out_csv.writerow(['accuracies'] + accuracies)
+        out_csv.writerow(['attack_success_rates'] + attack_success_rates)
+        out_csv.writerow(['time_usage'] + total_time_used)
         out_csv.writerow(['batch_size', args.batch_size])
         out_csv.writerow(['num_batches', args.num_batches])
         out_csv.writerow([''])
+
+
+if __name__ == '__main__':
+    main()

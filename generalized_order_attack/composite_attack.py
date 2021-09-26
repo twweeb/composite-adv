@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from math import pi
-from torchvision import transforms
 from . import sinkhorn
 import kornia
+import torch.nn.functional as F
 
 
 class CompositeAttack(nn.Module):
@@ -12,14 +11,14 @@ class CompositeAttack(nn.Module):
     Base class for attacks using the composite attack..
     """
 
-    def __init__(self, model, enabled_attack, mode='eval',
+    def __init__(self, model, enabled_attack, mode='eval', local_rank=-1,
                  hue_epsilon=None, sat_epsilon=None, rot_epsilon=None,
                  bright_epsilon=None, contrast_epsilon=None, linf_epsilon=None,
                  attack_power='strong',
                  start_num=1, iter_num=5, inner_iter_num=10, multiple_rand_start=True, order_schedule='random'):
         super().__init__()
         self.model = model
-        self.loss = nn.CrossEntropyLoss().cuda()
+        self.local_rank = local_rank
         self.fixed_order = enabled_attack
         self.enabled_attack = tuple(sorted(enabled_attack))
         self.mode = mode
@@ -124,7 +123,8 @@ class CompositeAttack(nn.Module):
 
             if self.order_schedule == 'fixed':
                 self.fixed_order = tuple([self.enabled_attack.index(i) for i in self.fixed_order])
-                self.curr_seq = torch.tensor(self.fixed_order).cuda()
+                self.curr_seq = torch.tensor(self.fixed_order).cuda(self.local_rank) if self.local_rank != -1 else \
+                    torch.tensor(self.fixed_order).cuda()
                 self.curr_dsm = sinkhorn.convert_seq_to_dsm(self.curr_seq)
 
             assert self.curr_seq is not None
@@ -134,10 +134,11 @@ class CompositeAttack(nn.Module):
             self.batch_size = inputs.shape[0]
         self._setup_attack()
 
-        self.is_attacked = torch.zeros(self.batch_size).bool().cuda()
-        self.is_not_attacked = torch.ones(self.batch_size).bool().cuda()
-
         if self.mode == 'eval':
+            self.is_attacked = torch.zeros(self.batch_size).bool().cuda(
+                self.local_rank) if self.local_rank != -1 else torch.zeros(self.batch_size).bool().cuda()
+            self.is_not_attacked = torch.ones(self.batch_size).bool().cuda(
+                self.local_rank) if self.local_rank != -1 else torch.ones(self.batch_size).bool().cuda()
             return self.attack_eval(inputs, labels)
 
         return self.attack_train(inputs, labels)
@@ -158,7 +159,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = torch.logical_or(ori_is_attacked, torch.logical_or(ori_is_attacked, cur_pred != labels))
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 hue_grad = torch.autograd.grad(cost, hue, retain_graph=True)[0]
             else:
@@ -187,7 +188,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 sat_grad = torch.autograd.grad(cost, sat, retain_graph=True)[0]
             else:
@@ -203,12 +204,19 @@ class CompositeAttack(nn.Module):
 
     def eval_rot(self, data, theta, labels):
         def kornia_rotate(imgs, degree):
-            angle = torch.ones(imgs.shape[0]).cuda() * degree
+            if self.local_rank != -1:
+                angle = torch.ones(imgs.shape[0]).cuda(self.local_rank) * degree
+                center = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
+                center[..., 0] = imgs.shape[2] / 2  # x
+                center[..., 1] = imgs.shape[3] / 2  # y
+                scale = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
+            else:
+                angle = torch.ones(imgs.shape[0]).cuda() * degree
+                center = torch.ones(imgs.shape[0], 2).cuda()
+                center[..., 0] = imgs.shape[2] / 2  # x
+                center[..., 1] = imgs.shape[3] / 2  # y
+                scale = torch.ones(imgs.shape[0], 2).cuda()
 
-            center = torch.ones(imgs.shape[0], 2).cuda()
-            center[..., 0] = imgs.shape[2] / 2  # x
-            center[..., 1] = imgs.shape[3] / 2  # y
-            scale = torch.ones(imgs.shape[0], 2).cuda()
             M = kornia.get_rotation_matrix2d(center, angle, scale)
             imgs_rotated = kornia.warp_affine(imgs, M, dsize=(imgs.shape[2], imgs.shape[3]))
             return imgs_rotated
@@ -227,7 +235,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 theta_grad = torch.autograd.grad(cost, theta, retain_graph=True)[0]
             else:
@@ -256,7 +264,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 brightness_grad = torch.autograd.grad(cost, brightness, retain_graph=True)[0]
             else:
@@ -287,7 +295,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 contrast_grad = torch.autograd.grad(cost, contrast, retain_graph=True)[0]
             else:
@@ -312,7 +320,7 @@ class CompositeAttack(nn.Module):
             self.is_attacked = cur_pred != labels
 
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 img_grad = torch.autograd.grad(cost, data, retain_graph=True)[0]
             else:
@@ -333,7 +341,7 @@ class CompositeAttack(nn.Module):
                 break
             outputs = self.model(new_data)
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 hue_grad = torch.autograd.grad(cost, hue, retain_graph=True)[0]
             else:
@@ -357,7 +365,7 @@ class CompositeAttack(nn.Module):
             #     self.is_attacked = True
             #     break
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 sat_grad = torch.autograd.grad(cost, sat, retain_graph=True)[0]
             else:
@@ -372,12 +380,18 @@ class CompositeAttack(nn.Module):
         theta = theta.detach().requires_grad_()
 
         def kornia_rotate(imgs, degree):
-            angle = torch.ones(imgs.shape[0]).cuda() * degree
-
-            center = torch.ones(imgs.shape[0], 2).cuda()
-            center[..., 0] = imgs.shape[2] / 2  # x
-            center[..., 1] = imgs.shape[3] / 2  # y
-            scale = torch.ones(imgs.shape[0], 2).cuda()
+            if self.local_rank != -1:
+                angle = torch.ones(imgs.shape[0]).cuda(self.local_rank) * degree
+                center = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
+                center[..., 0] = imgs.shape[2] / 2  # x
+                center[..., 1] = imgs.shape[3] / 2  # y
+                scale = torch.ones(imgs.shape[0], 2).cuda(self.local_rank)
+            else:
+                angle = torch.ones(imgs.shape[0]).cuda() * degree
+                center = torch.ones(imgs.shape[0], 2).cuda()
+                center[..., 0] = imgs.shape[2] / 2  # x
+                center[..., 1] = imgs.shape[3] / 2  # y
+                scale = torch.ones(imgs.shape[0], 2).cuda()
             M = kornia.get_rotation_matrix2d(center, angle, scale)
             imgs_rotated = kornia.warp_affine(imgs, M, dsize=(imgs.shape[2], imgs.shape[3]))
             return imgs_rotated
@@ -392,7 +406,7 @@ class CompositeAttack(nn.Module):
             #     self.is_attacked = True
             #     break
             self.model.zero_grad()
-            cost = self.loss(outputs, labels).cuda()
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 theta_grad = torch.autograd.grad(cost, theta, retain_graph=True)[0]
             else:
@@ -416,7 +430,7 @@ class CompositeAttack(nn.Module):
             #     self.is_attacked = True
             #     break
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 brightness_grad = torch.autograd.grad(cost, brightness, retain_graph=True)[0]
             else:
@@ -441,7 +455,7 @@ class CompositeAttack(nn.Module):
             #     self.is_attacked = True
             #     break
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 contrast_grad = torch.autograd.grad(cost, contrast, retain_graph=True)[0]
             else:
@@ -457,7 +471,7 @@ class CompositeAttack(nn.Module):
         for i in range(self.inner_iter_num):
             outputs = self.model(data)
             self.model.zero_grad()
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             if i + 1 == self.inner_iter_num:
                 img_grad = torch.autograd.grad(cost, data, retain_graph=True)[0]
             else:
@@ -484,7 +498,7 @@ class CompositeAttack(nn.Module):
             outputs = self.model(adv_img)
             self.model.zero_grad()
 
-            cost = self.loss(outputs, labels)
+            cost = F.cross_entropy(outputs, labels)
             cost.backward(retain_graph=True)
             dsm_grad = torch.autograd.grad(cost, self.curr_dsm, create_graph=False, retain_graph=False)[0]
             half_dsm = self.curr_dsm * torch.exp(-dsm_grad * 0.5)
@@ -501,8 +515,10 @@ class CompositeAttack(nn.Module):
         attack = self.attack_dict
         attack_num = len(self.curr_seq)
         adv_img = images
-
-        adv_val_saved = torch.zeros((attack_num, self.batch_size)).cuda()
+        if self.local_rank != -1:
+            adv_val_saved = torch.zeros((attack_num, self.batch_size)).cuda(self.local_rank)
+        else:
+            adv_val_saved = torch.zeros((attack_num, self.batch_size)).cuda()
         for i in range(self.start_num):
             adv_val = [self.adv_val_space[idx][i] for idx in range(attack_num)]
             if adv_val_saved is not None:

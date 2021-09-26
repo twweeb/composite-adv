@@ -30,6 +30,8 @@ parser.add_argument('attacks', metavar='attack', type=str, nargs='+',
 
 parser.add_argument('--checkpoint', type=str, default=None,
                     help='checkpoint path')
+parser.add_argument('--stat-dict', type=str, default=None,
+                    help='key of stat dict in checkpoint')
 parser.add_argument('--arch', type=str, default='resnet50',
                     help='model architecture')
 parser.add_argument('--dataset', type=str, default='cifar',
