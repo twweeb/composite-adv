@@ -15,7 +15,7 @@ import numpy as np
 import random
 from models.wideresnet import *
 from generalized_order_attack.attacks import *
-from generalized_order_attack.utilities import imshow
+from generalized_order_attack.utilities import imshow, InputNormalize
 from models.resnet import *
 from robustness.cifar_models.resnet import *
 from torch.autograd import Variable
@@ -217,8 +217,40 @@ def load_model(args, ngpus_per_node):
     # Given Architecture
     if args.arch == 'wideresnet':
         model = WideResNet()
+        if args.checkpoint is not None and os.path.exists(args.checkpoint):
+            if args.stat_dict == 'trades':
+                checkpoint = torch.load(args.checkpoint)
+                # sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
+                model.load_state_dict(checkpoint)
+                print("=> loaded checkpoint '{}'".format(args.checkpoint))
     elif args.arch == 'resnet50':
         model = ResNet50()
+        if args.checkpoint is not None and os.path.exists(args.checkpoint):
+            checkpoint = torch.load(args.checkpoint)
+            if args.stat_dict == 'madry':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['cifar']('../data/')
+                model = _dataset.get_model(args.arch, False)
+                model = AttackerModel(model, _dataset)
+
+                state_dict_path = 'model'
+                if not ('model' in checkpoint):
+                    state_dict_path = 'state_dict'
+
+                sd = checkpoint[state_dict_path]
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+                model.load_state_dict(sd)
+                model = model.model
+                print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                print('Natural accuracy --> {}'.format(checkpoint['nat_prec1']))
+                print('Robust accuracy --> {}'.format(checkpoint['adv_prec1']))
+
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                                   torch.tensor([0.2023, 0.1994, 0.2010])),
+                    model
+                )
     else:
         print('Model architecture not specified.')
         raise ValueError()
@@ -232,7 +264,11 @@ def load_model(args, ngpus_per_node):
             model.cuda(args.gpu)
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+            if args.arch == 'wideresnet':
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],
+                                                                  find_unused_parameters=True)
+            else:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model)
@@ -250,13 +286,12 @@ def load_model(args, ngpus_per_node):
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    if os.path.exists(args.checkpoint):
+    if args.checkpoint is not None and os.path.exists(args.checkpoint):
         if args.arch == 'wideresnet':
-            checkpoint = torch.load(args.checkpoint)
             if args.stat_dict == 'trades':
-                sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
-                model.load_state_dict(sd)
+                pass
             elif args.stat_dict == 'gat':
+                checkpoint = torch.load(args.checkpoint)
                 if isinstance(checkpoint, dict):
                     if 'model_state_dict' in checkpoint:
                         sd = checkpoint['model_state_dict']
@@ -278,15 +313,15 @@ def load_model(args, ngpus_per_node):
                     raise ValueError()
             else:
                 raise ValueError()
-
         elif args.arch == 'resnet50':
-            try:
-                checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
+            if args.stat_dict == 'madry':
+                pass
+            elif args.stat_dict == 'pat':
+                pass
+            elif args.stat_dict == 'gat':
+                checkpoint = torch.load(args.checkpoint)
                 if isinstance(checkpoint, dict):
-                    if 'model' in checkpoint:
-                        model.load_state_dict(checkpoint['model'])
-                        print('model')
-                    elif 'model_state_dict' in checkpoint:
+                    if 'model_state_dict' in checkpoint:
                         model.load_state_dict(checkpoint['model_state_dict'])
                     elif 'state_dict' in checkpoint:
                         model.load_state_dict(checkpoint['state_dict'])
@@ -303,9 +338,12 @@ def load_model(args, ngpus_per_node):
                     print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
                     print('best_accuracy --> ', best_acc1)
                     print('No improve --> ', no_improve)
-
-            except RuntimeError as error:
-                raise error  # type: ignore
+                else:
+                    raise ValueError("Checkpoint is not a dictionary.")
+            else:
+                raise ValueError("State Dict Not Specified.")
+        else:
+            raise ValueError("Model Architecture Not Specified.")
 
     return model, optimizer, criterion
 
@@ -400,7 +438,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
         test_loss, test_acc1 = eval_test(model, test_loader, args)
         print("Test Accuracy: {}%".format(test_acc1))
 
-    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', local_rank=args.rank,
+    pgd_attack = CompositeAttack(model, args.enable, mode='train', local_rank=args.rank,
                                  attack_power=args.power, start_num=start_num, iter_num=iter_num,
                                  inner_iter_num=inner_iter_num, multiple_rand_start=True, order_schedule=args.order)
 

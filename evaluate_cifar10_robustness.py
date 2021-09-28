@@ -4,6 +4,7 @@ import csv
 import argparse
 import os
 from generalized_order_attack.attacks import *
+from generalized_order_attack.utilities import InputNormalize
 import torch.multiprocessing as mp
 from torch.utils.data import SubsetRandomSampler, DataLoader
 import torch.distributed as dist
@@ -169,7 +170,64 @@ def load_model(args, ngpus_per_node):
     if args.arch == 'wideresnet':
         model = WideResNet()
     elif args.arch == 'resnet50':
-        model = ResNet50()
+        if args.stat_dict == 'madry':
+            from robustness.datasets import DATASETS
+            from robustness.attacker import AttackerModel
+            _dataset = DATASETS['cifar']('../data/')
+            model = _dataset.get_model(args.arch, False)
+            model = AttackerModel(model, _dataset)
+            # This should be handle first.
+            checkpoint = torch.load(args.checkpoint)
+            state_dict_path = 'model'
+            if not ('model' in checkpoint):
+                state_dict_path = 'state_dict'
+
+            sd = checkpoint[state_dict_path]
+            sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+            model = model.model
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+            print('Natural accuracy --> {}'.format(checkpoint['nat_prec1']))
+            print('Robust accuracy --> {}'.format(checkpoint['adv_prec1']))
+
+            # Since Madry's pretrained model only accept normalized tensor,
+            # we need to add an layer to normalize before inference.
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                               torch.tensor([0.2023, 0.1994, 0.2010])),
+                model
+            )
+        elif args.stat_dict == 'gat':
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                               torch.tensor([0.2023, 0.1994, 0.2010])),
+                ResNet50()
+            )
+        elif args.stat_dict == 'pat': # To Debug
+            from robustness.datasets import DATASETS
+            from robustness.attacker import AttackerModel
+            _dataset = DATASETS['cifar']('../data/')
+            model = _dataset.get_model(args.arch, False)
+            model = AttackerModel(model, _dataset)
+            model = model.model
+
+            checkpoint = torch.load(args.checkpoint)
+            state_dict_path = 'model'
+            if not ('model' in checkpoint):
+                state_dict_path = 'state_dict'
+
+            sd = checkpoint[state_dict_path]
+            sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                               torch.tensor([0.2023, 0.1994, 0.2010])),
+                model
+            )
+        else:
+            model = ResNet50()
     else:
         print('Model architecture not specified.')
         raise ValueError()
@@ -183,7 +241,11 @@ def load_model(args, ngpus_per_node):
             model.cuda(args.gpu)
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+            if args.arch == 'wideresnet':
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],
+                                                                  find_unused_parameters=True)
+            else:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model)
@@ -209,25 +271,32 @@ def load_model(args, ngpus_per_node):
                     if 'model_state_dict' in checkpoint:
                         sd = checkpoint['model_state_dict']
                         # sd = {k[len('module.'):]: v for k, v in sd.items()}  # Use this if missing key matching
+                        sd = {'module.'+k: v for k, v in sd.items()}  # Use this if missing key matching
                         model.load_state_dict(sd)
+                    else:
+                        raise ValueError("Please check State Dict key of checkpoint.")
                     print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+            else:
+                raise ValueError()
 
         elif args.arch == 'resnet50':
-            try:
-                checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
+            if args.stat_dict == 'madry':
+                pass
+            elif args.stat_dict == 'pat':
+                pass
+            elif args.stat_dict == 'gat':  # Not Implemented Yet.
+                checkpoint = torch.load(args.checkpoint)
                 if isinstance(checkpoint, dict):
-                    if 'model' in checkpoint:
-                        model.load_state_dict(checkpoint['model'])
-                        print('model')
-                    elif 'model_state_dict' in checkpoint:
+                    if 'model_state_dict' in checkpoint:
                         model.load_state_dict(checkpoint['model_state_dict'])
-                    elif 'state_dict' in checkpoint:
-                        model.load_state_dict(checkpoint['state_dict'])
 
-                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
-
-            except RuntimeError as error:
-                raise error  # type: ignore
+                        print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                else:
+                    raise ValueError()
+            else:
+                raise ValueError("State Dict Not Specified.")
+        else:
+            ValueError("model architecture not specified.")
 
     return model
 

@@ -525,7 +525,7 @@ class CompositeAttack(nn.Module):
 
                 if self.is_attacked.sum() == self.batch_size:
                     break
-                else:
+                elif 1 < self.iter_num != j:
                     self.update_dsm(adv_img, labels)
 
         return adv_img
@@ -533,15 +533,17 @@ class CompositeAttack(nn.Module):
     def attack_train(self, images, labels):
         attack = self.attack_dict
         attack_num = len(self.curr_seq)
-        adv_img = None
+        adv_img = images
 
         for i in range(self.start_num):
             adv_val = [self.adv_val_space[idx][i].requires_grad_() for idx in range(attack_num)]
 
             if self.order_schedule == 'scheduled':
                 self.curr_dsm.requires_grad_()
+            else:
+                self.update_dsm(adv_img, labels)
             for j in range(self.iter_num):
-                adv_img = images.data
+                adv_img = adv_img.detach()
                 adv_img.requires_grad = True
 
                 for tdx in range(attack_num):
@@ -552,19 +554,17 @@ class CompositeAttack(nn.Module):
                         if idx == self.linf_idx:
                             adv_img = (self.curr_dsm[tdx][idx] / m) * attack[idx](adv_img, labels)
                         else:
-                            adv_obj = attack[idx](adv_img, adv_val[idx], labels)
-                            adv_img = (self.curr_dsm[tdx][idx] / m) * adv_obj[0]
-                            adv_val[idx] = adv_obj[1]
+                            adv_img, adv_val[idx] = attack[idx](adv_img, adv_val[idx], labels)
+                            adv_img = (self.curr_dsm[tdx][idx] / m) * adv_img
                     else:
                         if idx == self.linf_idx:
                             adv_img = attack[idx](adv_img, labels)
                         else:
-                            adv_obj = attack[idx](adv_img, adv_val[idx], labels)
-                            adv_img = adv_obj[0]
-                            adv_val[idx] = adv_obj[1]
+                            adv_img, adv_val[idx] = attack[idx](adv_img, adv_val[idx], labels)
 
+                if 1 < self.iter_num != j:
                     self.update_dsm(adv_img, labels)
 
-            images = adv_img.detach()
+            adv_img = adv_img.detach()
 
-        return images
+        return adv_img
