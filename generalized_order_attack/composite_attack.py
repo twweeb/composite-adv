@@ -56,7 +56,7 @@ class CompositeAttack(nn.Module):
             self.eps_pool = self.eps_pool_tough
         elif attack_power == 'im_strong':
             self.eps_pool = self.eps_pool_im_strong
-        elif attack_power == 'im_tough':
+        elif attack_power == 'im_tough':  # Used for generating adversarial examples.
             self.eps_pool = self.eps_pool_im_tough
         else:
             print("Does not specify attack power, using default:", "weak")
@@ -71,11 +71,8 @@ class CompositeAttack(nn.Module):
             self.order_schedule = order_schedule
 
         self.start_num = start_num
-        self.iter_num = iter_num if self.order_schedule == 'scheduled' else 1
-        if mode == 'fast_train':
-            self.inner_iter_num = 10
-        else:
-            self.inner_iter_num = 5 if inner_iter_num is None else inner_iter_num
+        self.iter_num = iter_num if self.order_schedule == 'scheduled' else 1   # Number of rescheduled
+        self.inner_iter_num = 10 if inner_iter_num is None else inner_iter_num  # Number of component-wise pgd updates
         self.step_size_pool = [2.5 * ((eps[1] - eps[0]) / 2) / self.inner_iter_num for eps in
                                self.eps_pool]  # 2.5 * ε-test / num_steps
         self.multiple_rand_start = multiple_rand_start  # False: start from little epsilon to the upper bound
@@ -320,6 +317,7 @@ class CompositeAttack(nn.Module):
 
         new_data = kornia.enhance.adjust_hue(data, hue)
         if self.mode == 'fast_train':
+            self.model.zero_grad()
             return new_data, hue
 
         for i in range(self.inner_iter_num):
@@ -341,6 +339,7 @@ class CompositeAttack(nn.Module):
 
         new_data = kornia.enhance.adjust_saturation(data, sat)
         if self.mode == 'fast_train':
+            self.model.zero_grad()
             return new_data, sat
 
         for i in range(self.inner_iter_num):
@@ -362,6 +361,7 @@ class CompositeAttack(nn.Module):
 
         new_data = kornia.geometry.transform.rotate(data, theta)
         if self.mode == 'fast_train':
+            self.model.zero_grad()
             return new_data, theta
 
         for i in range(self.inner_iter_num):
@@ -383,6 +383,7 @@ class CompositeAttack(nn.Module):
 
         new_data = kornia.enhance.adjust_brightness(data, brightness)
         if self.mode == 'fast_train':
+            self.model.zero_grad()
             return new_data, brightness
 
         for i in range(self.inner_iter_num):
@@ -405,6 +406,7 @@ class CompositeAttack(nn.Module):
 
         new_data = kornia.enhance.adjust_contrast(data, contrast)
         if self.mode == 'fast_train':
+            self.model.zero_grad()
             return new_data, contrast
 
         for i in range(self.inner_iter_num):

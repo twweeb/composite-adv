@@ -19,10 +19,11 @@ import random
 from models.wideresnet import *
 from torchvision.models import resnet50
 import matplotlib.pyplot as plt
-from livelossplot import PlotLosses
-from livelossplot.outputs import MatplotlibPlot
+from generalized_order_attack.utilities import imshow, InputNormalize
+from torch.autograd import Variable
 from generalized_order_attack.attacks import *
 from trades import trades_loss
+import json
 
 
 def list_type(s):
@@ -34,8 +35,6 @@ def list_type(s):
 
 parser = argparse.ArgumentParser(description='PyTorch Tiny ImageNet Natural Training')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
-parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train')
@@ -69,6 +68,8 @@ parser.add_argument('--dist', default='comp', type=str,
                     help='distance metric')
 parser.add_argument('--mode', default='natural', type=str,
                     help='specify training mode (natural or adv_train)')
+parser.add_argument('--debug', action='store_true',
+                    help='Train Only One Epoch and print training images.')
 parser.add_argument('--checkpoint', type=str, default=None, help='path of checkpoint')
 parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed training')
 parser.add_argument('--order', default='random', type=str, help='specify the order')
@@ -111,6 +112,8 @@ inner_iter_num = 10
 
 sequence_single = [(0,), (1,), (2,), (3,), (4,), (5,)]
 attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
+class_idx = json.load(open("./generalized_order_attack/labels/imagenet_class_index.json"))
+classes_map = [class_idx[str(k)][1] for k in range(len(class_idx))]
 
 
 def main():
@@ -188,7 +191,7 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=args.workers,
                                                       batch_size=args.batch_size, distributed=args.distributed)
     test_loader, _ = generate_dataloader(VALID_DIR, "val", transform_test, workers=args.workers,
-                                         batch_size=args.test_batch_size)
+                                         batch_size=args.batch_size)
 
     train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node)
 
@@ -225,14 +228,8 @@ def load_model(args, ngpus_per_node):
     global best_acc1
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    epoch = 0
     if args.arch == 'wideresnet':
-        model = WideResNet(num_classes=200).cuda()
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-        model = nn.Sequential(
-            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            model
-        )
+        raise NotImplementedError()
     elif args.arch == 'resnet50':
         if args.checkpoint is not None:
             if args.stat_dict is None or args.stat_dict == 'madry':
@@ -260,7 +257,8 @@ def load_model(args, ngpus_per_node):
                     raise ValueError(error_msg)
 
                 model = nn.Sequential(
-                    Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
                     model.model
                 )
                 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
@@ -272,7 +270,8 @@ def load_model(args, ngpus_per_node):
                 model = _dataset.get_model(args.arch, False)
                 model = AttackerModel(model, _dataset)
                 model = nn.Sequential(
-                    Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
                     model.model
                 )
                 try:
@@ -300,7 +299,8 @@ def load_model(args, ngpus_per_node):
         else:
             model = resnet50(pretrained=True)
             model = nn.Sequential(
-                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                               torch.tensor([0.229, 0.224, 0.225])),
                 model
             )
             optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
@@ -318,7 +318,11 @@ def load_model(args, ngpus_per_node):
             model.cuda(args.gpu)
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            if args.arch == 'wideresnet':
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],
+                                                                  find_unused_parameters=True)
+            else:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model)
@@ -426,33 +430,64 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
             optimizer.zero_grad()
             logits = model(data)
             loss = criterion(logits, target)
+            raise ValueError()
 
         # adv training normal
-        elif args.mode == 'adv_train':
-
+        elif args.mode == 'adv_train_madry':
             model.eval()
-            x_adv = pgd_attack(data, target)
+            # generate adversarial example
+            if args.gpu is not None:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda(args.gpu, non_blocking=True).detach()
+            else:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
+
+            data_adv = pgd_attack(data_adv, target)
+            data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
+            if args.debug:
+                imshow(data, model, classes_map,
+                       ground_truth=target, save_file='images/train/imagenet_adv_train_madry (clean).pdf', show=False)
+                imshow(data_adv, model, classes_map,
+                       ground_truth=target, save_file='images/train/imagenet_adv_train_madry (attack).pdf', show=False)
+                break
+
             model.train()
 
             # zero gradient
             optimizer.zero_grad()
-            logits = model(x_adv)
+            logits = model(data_adv)
             loss = criterion(logits, target)
 
         # adv training by trades
         elif args.mode == 'adv_train_trades':
             # TRADE Loss would require more memory.
-            loss, lost_nat, loss_adv = trades_loss(model=model,
-                                                   x_natural=data,
-                                                   y=target,
-                                                   local_rank=args.rank,
-                                                   optimizer=optimizer,
-                                                   pgd_attack=pgd_attack,
-                                                   step_size=args.step_size,
-                                                   epsilon=args.epsilon,
-                                                   perturb_steps=args.num_steps,
-                                                   beta=args.beta,
-                                                   distance=args.dist)
+
+            model.eval()
+            batch_size = len(data)
+            # generate adversarial example
+            if args.gpu is not None:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda(args.gpu, non_blocking=True).detach()
+            else:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
+
+            data_adv = pgd_attack(data_adv, target)
+            data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
+            if args.debug:
+                imshow(data, model, classes_map,
+                       ground_truth=target, save_file='images/train/imagenet_adv_train_trades (clean).pdf', show=False)
+                imshow(data_adv, model, classes_map,
+                       ground_truth=target, save_file='images/train/imagenet_adv_train_trades (attack).pdf', show=False)
+                break
+
+            model.train()
+            # zero gradient
+            optimizer.zero_grad()
+
+            # calculate robust loss
+            logits = model(data)
+            loss_natural = F.cross_entropy(logits, target)
+            loss_robust = (1.0 / batch_size) * F.kl_div(F.log_softmax(model(data_adv), dim=1),
+                                                        F.softmax(model(data), dim=1))
+            loss = loss_natural + args.beta * loss_robust
 
         else:
             print("Not Specify Training Mode.")
@@ -477,7 +512,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
 
     exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
 
-    pgd_attack = CompositeAttack(model, args.enable, mode='train', attack_power=args.power,
+    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', attack_power=args.power,
                                  start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
                                  multiple_rand_start=True, order_schedule=args.order)
 

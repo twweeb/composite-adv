@@ -72,7 +72,7 @@ parser.add_argument('--local_rank', default=-1, type=int, help='node rank for di
 parser.add_argument('--order', default='random', type=str, help='specify the order')
 parser.add_argument('--stat-dict', type=str, default=None,
                     help='key of stat dict in checkpoint')
-parser.add_argument("--enable", type=list_type, default=(0, 1), help="list of enabled attacks")
+parser.add_argument("--enable", type=list_type, default=(0, 1, 2, 3, 4, 5), help="list of enabled attacks")
 parser.add_argument("--power", type=str, default='strong', help="level of attack power")
 parser.add_argument("--linf_loss", type=str, default='ce', help="loss for linf-attack, ce or kl")
 parser.add_argument("--log_filename", default='logfile.csv', help="filename of output log")
@@ -217,12 +217,6 @@ def load_model(args, ngpus_per_node):
     # Given Architecture
     if args.arch == 'wideresnet':
         model = WideResNet()
-        if args.checkpoint is not None and os.path.exists(args.checkpoint):
-            if args.stat_dict == 'trades':
-                checkpoint = torch.load(args.checkpoint)
-                # sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
-                model.load_state_dict(checkpoint)
-                print("=> loaded checkpoint '{}'".format(args.checkpoint))
     elif args.arch == 'resnet50':
         model = ResNet50()
         if args.checkpoint is not None and os.path.exists(args.checkpoint):
@@ -289,7 +283,10 @@ def load_model(args, ngpus_per_node):
     if args.checkpoint is not None and os.path.exists(args.checkpoint):
         if args.arch == 'wideresnet':
             if args.stat_dict == 'trades':
-                pass
+                checkpoint = torch.load(args.checkpoint)
+                sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
+                model.load_state_dict(sd)
+                print("=> loaded checkpoint '{}'".format(args.checkpoint))
             elif args.stat_dict == 'gat':
                 checkpoint = torch.load(args.checkpoint)
                 if isinstance(checkpoint, dict):
@@ -366,17 +363,24 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
             optimizer.zero_grad()
             logits = model(data)
             loss = criterion(logits, target)
+            raise ValueError()
 
         # adv training normal
-        elif args.mode == 'adv_train':
+        elif args.mode == 'adv_train_madry':
             model.eval()
-            data_adv = pgd_attack(data, target)
-            # x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
+            # generate adversarial example
+            if args.gpu is not None:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda(args.gpu, non_blocking=True).detach()
+            else:
+                data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
+
+            data_adv = pgd_attack(data_adv, target)
+            data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
             if args.debug:
                 imshow(data, model, classes_map,
-                       ground_truth=target, save_file='images/train/cifar10_adv_train (clean).pdf', show=False)
+                       ground_truth=target, save_file='images/train/cifar10_adv_train_madry (clean).pdf', show=False)
                 imshow(data_adv, model, classes_map,
-                       ground_truth=target, save_file='images/train/cifar10_adv_train (attack).pdf', show=False)
+                       ground_truth=target, save_file='images/train/cifar10_adv_train_madry (attack).pdf', show=False)
                 break
 
             model.train()
@@ -389,6 +393,7 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
         # adv training by trades
         elif args.mode == 'adv_train_trades':
             # TRADE Loss would require more memory.
+
             model.eval()
             batch_size = len(data)
             # generate adversarial example
@@ -438,7 +443,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
         test_loss, test_acc1 = eval_test(model, test_loader, args)
         print("Test Accuracy: {}%".format(test_acc1))
 
-    pgd_attack = CompositeAttack(model, args.enable, mode='train', local_rank=args.rank,
+    pgd_attack = CompositeAttack(model, args.enable, mode='fast_train', local_rank=args.rank,
                                  attack_power=args.power, start_num=start_num, iter_num=iter_num,
                                  inner_iter_num=inner_iter_num, multiple_rand_start=True, order_schedule=args.order)
 
