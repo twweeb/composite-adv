@@ -307,9 +307,8 @@ def imshow(data, model, classes_map, ground_truth=None, save_file='print_grid.pd
     data_labels = output.max(1, keepdim=True)[1].cpu()
     ground_truth = ground_truth.cpu() if ground_truth is not None else ground_truth
 
-    data = data.cpu()
     for i in range(1, cols * rows + 1):
-        img, label = data[i], data_labels[i]
+        img, label = data[i].detach().cpu(), data_labels[i].detach().cpu()
         figure.add_subplot(rows, cols, i)
         if ground_truth is not None:
             plt.title(classes_map[label]+" ("+classes_map[ground_truth[i]]+")")

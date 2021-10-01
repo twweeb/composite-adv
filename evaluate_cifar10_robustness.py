@@ -4,7 +4,7 @@ import csv
 import argparse
 import os
 from generalized_order_attack.attacks import *
-from generalized_order_attack.utilities import InputNormalize, get_dataset_model
+from generalized_order_attack.utilities import imshow, InputNormalize, get_dataset_model
 import torch.multiprocessing as mp
 from torch.utils.data import SubsetRandomSampler, DataLoader
 import torch.distributed as dist
@@ -50,6 +50,8 @@ parser.add_argument('--per_example', action='store_true', default=False,
                     help='output per-example accuracy')
 parser.add_argument('--message', type=str, default="",
                     help='csv message before result')
+parser.add_argument('--debug', action='store_true',
+                    help='Train Only One Epoch and print training images.')
 parser.add_argument('--seed', type=int, default=0, help='RNG seed')
 
 parser.add_argument('--output', type=str, help='output CSV')
@@ -66,6 +68,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+
+classes_map = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
 
 def main():
@@ -391,10 +395,16 @@ def evaluate(model, val_loader, ngpus_per_node, args):
         if torch.cuda.is_available():
             inputs = inputs.cuda()
             labels = labels.cuda()
-
+        file_no = 7
         for attack_name, attack in zip(attack_names, attacks):
             batch_tic = time.perf_counter()
             adv_inputs = attack(inputs, labels)
+            if args.debug:
+                imshow(inputs, model, classes_map, ground_truth=labels,
+                       save_file='images/train/cifar10_eval_'+str(file_no)+' (clean).pdf', show=False)
+                imshow(adv_inputs, model, classes_map, ground_truth=labels,
+                       save_file='images/train/cifar10_eval_'+str(file_no)+' (attack).pdf', show=False)
+                file_no = file_no + 1
             with torch.no_grad():
                 ori_logits = model(inputs)
                 adv_logits = model(adv_inputs)
@@ -413,6 +423,9 @@ def evaluate(model, val_loader, ngpus_per_node, args):
             batches_ori_correct[attack_name].append(batch_ori_correct)
             batches_correct[attack_name].append(batch_correct)
             batches_time_used[attack_name].append(time_used)
+
+        if args.debug:
+            return
 
     print('OVERALL')
     accuracies = []

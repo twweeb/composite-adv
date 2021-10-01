@@ -13,7 +13,9 @@ from torch.utils.data import SubsetRandomSampler, DataLoader
 from torchvision import datasets, transforms
 from torchvision.models import resnet50
 from models.wideresnet import *
+from models.resnet import *
 from generalized_order_attack.attacks import *
+from generalized_order_attack.utilities import InputNormalize, get_dataset_model
 import warnings
 from math import pi
 warnings.filterwarnings('ignore')
@@ -34,10 +36,11 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('attacks', metavar='attack', type=str, nargs='+',
                     help='attack names')
-
 parser.add_argument('--checkpoint', type=str, help='checkpoint path')
 parser.add_argument('--arch', type=str, default='resnet50',
                     help='model architecture')
+parser.add_argument('--stat-dict', type=str, default=None,
+                    help='key of stat dict in checkpoint')
 parser.add_argument('--dataset', type=str, default='cifar',
                     help='dataset name')
 parser.add_argument('--dataset_path', type=str, default='../data',
@@ -53,6 +56,8 @@ parser.add_argument('--shuffle', default=False, action='store_true',
 parser.add_argument('--layout', type=str, default='vertical',
                     help='lay out the same images on the same row '
                          '(horizontal) or column (vertical)')
+parser.add_argument('--robust_num', type=int, default=0,
+                    help='numbers of attacks use unsuccessful examples')
 parser.add_argument('--only_successful', action='store_true',
                     default=False,
                     help='only show images where adversarial example '
@@ -61,21 +66,23 @@ parser.add_argument('--seed', type=int, default=0, help='RNG seed')
 parser.add_argument('--output', type=str,
                     help='output PNG file')
 
-
-class Normalize(nn.Module):
-    def __init__(self, mean, std):
-        super().__init__()
-        self.normalize = transforms.Normalize(mean=mean, std=std)
-
-    def forward(self, input_tensor):
-        return self.normalize(input_tensor)
+cifar_namelist = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
 
-def generate_dataloader(data, transform, shuffle, workers, batch_size):
+def generate_dataloader(data, dataset_name, shuffle, workers, batch_size):
     if data is None:
         return None
 
-    dataset = datasets.ImageFolder(data, transform=transform)
+    # setup data loader
+    if 'cifar' in dataset_name:
+        dataset = datasets.CIFAR10(root=data, train=False, download=False, transform=transforms.ToTensor())
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+        dataset = datasets.ImageFolder(data, transform=transform)
 
     # Wrap image dataset (defined above) in dataloader
     dataloader = DataLoader(dataset, batch_size=batch_size,
@@ -86,28 +93,158 @@ def generate_dataloader(data, transform, shuffle, workers, batch_size):
     return dataloader
 
 
-def load_model(args):
+def load_imagenet_model(args):
     if args.arch == 'wideresnet':
         _model = WideResNet(num_classes=200).cuda()
     elif args.arch == 'resnet50':
         _model = resnet50(pretrained=True)
     else:
         print('Model architecture not specified.')
+        raise ValueError()
 
     _model = nn.Sequential(
-        Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                       torch.tensor([0.229, 0.224, 0.225])),
         _model
     )
     return _model
+
+
+def load_cifar10_model(args):
+    # Given Architecture
+    if args.arch == 'wideresnet':
+        model = WideResNet()
+    elif args.arch == 'resnet50':
+        if args.stat_dict == 'madry':
+            from robustness.datasets import DATASETS
+            from robustness.attacker import AttackerModel
+            _dataset = DATASETS['cifar']('../data/')
+            model = _dataset.get_model(args.arch, False)
+            model = AttackerModel(model, _dataset)
+            # This should be handle first.
+            checkpoint = torch.load(args.checkpoint)
+            state_dict_path = 'model'
+            if not ('model' in checkpoint):
+                state_dict_path = 'state_dict'
+
+            sd = checkpoint[state_dict_path]
+            sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+            model = model.model
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+            print('Natural accuracy --> {}'.format(checkpoint['nat_prec1']))
+            print('Robust accuracy --> {}'.format(checkpoint['adv_prec1']))
+
+            # Since Madry's pretrained model only accept normalized tensor,
+            # we need to add an layer to normalize before inference.
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                               torch.tensor([0.2023, 0.1994, 0.2010])),
+                model
+            )
+        elif args.stat_dict == 'gat':
+            from robustness.datasets import DATASETS
+            from robustness.attacker import AttackerModel
+            _dataset = DATASETS['cifar']('../data/')
+            model = _dataset.get_model(args.arch, False)
+            model = AttackerModel(model, _dataset)
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
+                               torch.tensor([0.2023, 0.1994, 0.2010])),
+                model.model
+            )
+        elif args.stat_dict == 'pat':  # To Debug
+            _, model = get_dataset_model(args, dataset_path='../data', dataset_name='cifar')
+
+        elif args.stat_dict == 'gat-fromscratch':
+            model = ResNet50()
+        else:
+            model = ResNet50()
+    else:
+        print('Model architecture not specified.')
+        raise ValueError()
+
+    # Send to GPU
+    if not torch.cuda.is_available():
+        print('using CPU, this will be slow')
+    else:
+        model = torch.nn.DataParallel(model).cuda()
+
+    if os.path.exists(args.checkpoint):
+        if args.arch == 'wideresnet':
+            checkpoint = torch.load(args.checkpoint)
+            if args.stat_dict == 'trades':
+                sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
+                model.load_state_dict(sd)
+            elif args.stat_dict == 'gat' or args.stat_dict == 'gat-fromscratch':
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        sd = checkpoint['model_state_dict']
+                        # sd = {k[len('module.'):]: v for k, v in sd.items()}  # Use this if missing key matching
+                        # sd = {'module.'+k: v for k, v in sd.items()}  # Use this if missing key matching
+                        model.load_state_dict(sd)
+                    else:
+                        raise ValueError("Please check State Dict key of checkpoint.")
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                    print('nat_accuracy --> ', checkpoint['best_acc1'])
+            elif args.stat_dict == 'gat-previous':
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        sd = checkpoint['model_state_dict']
+                        # sd = {k[len('module.'):]: v for k, v in sd.items()}  # Use this if missing key matching
+                        if "finetune" not in args.checkpoint:
+                            sd = {'module.'+k: v for k, v in sd.items()}  # Use this if missing key matching
+                        model.load_state_dict(sd)
+                    else:
+                        raise ValueError("Please check State Dict key of checkpoint.")
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                    print('nat_accuracy --> ', checkpoint['best_acc1'])
+            else:
+                raise ValueError()
+
+        elif args.arch == 'resnet50':
+            if args.stat_dict == 'madry':
+                pass
+            elif args.stat_dict == 'pat':
+                pass
+            elif args.stat_dict == 'gat':
+                checkpoint = torch.load(args.checkpoint)
+                if isinstance(checkpoint, dict):
+                    state_dict_path = 'model_state_dict'
+
+                    sd = checkpoint[state_dict_path]
+                    # sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                    print('nat_accuracy --> ', checkpoint['best_acc1'])
+                else:
+                    raise ValueError()
+            elif args.stat_dict == 'gat-fromscratch':
+                checkpoint = torch.load(args.checkpoint)
+                if isinstance(checkpoint, dict):
+                    state_dict_path = 'model_state_dict'
+
+                    sd = checkpoint[state_dict_path]
+                    model.load_state_dict(sd)
+
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                    print('nat_accuracy --> ', checkpoint['best_acc1'])
+                else:
+                    raise ValueError()
+            else:
+                raise ValueError("State Dict Not Specified.")
+        else:
+            ValueError("model architecture not specified.")
+
+    return model
 
 
 def print_adv_examples(model, val_loader, args):
     inputs, labels = next(itertools.islice(
         val_loader, args.batch_index, None))
     if torch.cuda.is_available():
-        model.cuda()
-        inputs = inputs.cuda()
-        labels = labels.cuda()
+        inputs, labels = inputs.cuda(), labels.cuda()
     N, C, H, W = inputs.size()
 
     attacks = [None] + args.attacks
@@ -131,21 +268,29 @@ def print_adv_examples(model, val_loader, args):
 
             advs = attack(inputs, labels)
             adv_labels = model(advs).argmax(1)
+            unsuccessful = (adv_labels == labels).cpu().detach().numpy()\
+                .astype(bool)
             successful = (adv_labels != labels).cpu().detach().numpy() \
                 .astype(bool)
 
             print(f'accuracy = {np.mean(1 - successful) * 100:.1f}')
             diff = (advs - inputs).cpu().detach().numpy()
             advs = advs.cpu().detach().numpy()
-            out_advs[attack_index, successful] = advs[successful]
-            out_diffs[attack_index, successful] = diff[successful]
+            if attack_index < args.robust_num:
+                out_advs[attack_index, unsuccessful] = advs[unsuccessful]
+                out_diffs[attack_index, unsuccessful] = diff[unsuccessful]
+                all_successful[successful] = False
+            else:
+                out_advs[attack_index, successful] = advs[successful]
+                out_diffs[attack_index, successful] = diff[successful]
+                all_successful[unsuccessful] = False
 
             all_labels[attack_index] = adv_labels.cpu().detach().numpy()
 
-            all_successful[(adv_labels == orig_labels).cpu().detach().numpy().astype(bool)] = False
             # mark examples that changed by less than 1/1000 as not successful
             all_successful[np.all(np.abs(diff) < 1e-3,
                                   axis=(1, 2, 3))] = False
+            print(all_successful)
 
     if args.only_successful:
         out_advs = out_advs[:, all_successful]
@@ -203,24 +348,19 @@ def main():
         np.random.seed(args.seed)
         random.seed(args.seed)
 
-    model = load_model(args)
+    if 'cifar' in args.dataset:
+        model = load_cifar10_model(args)
+    else:
+        model = load_imagenet_model(args)
     model.eval()
     cudnn.benchmark = True
-    ngpus_per_node = torch.cuda.device_count()
 
-    # setup data loader
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])
-
-    DATA_DIR = '/work/hsiung1024/imagenet'  # Original images come in shapes of [3,64,64]
-    # Define training and validation data paths
-    VALID_DIR = os.path.join(DATA_DIR, 'val')
-
-    val_loader = generate_dataloader(VALID_DIR, transform_test, args.shuffle, workers=ngpus_per_node * 4,
-                                     batch_size=args.batch_size)
+    if 'cifar' in args.dataset:
+        val_loader = generate_dataloader('../data', args.dataset, args.shuffle,
+                                         workers=4, batch_size=args.batch_size)
+    else:
+        val_loader = generate_dataloader('/work/hsiung1024/imagenet/val', args.dataset, args.shuffle,
+                                         workers=4, batch_size=args.batch_size)
 
     examples_found = False
     while not examples_found:

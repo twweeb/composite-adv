@@ -292,12 +292,13 @@ class CompositeAttack(nn.Module):
     def eval_linf(self, data, labels):
         ori_data = data.detach()
         data.detach_().requires_grad_()
+        ori_is_attacked = self.is_attacked
 
         for i in range(self.inner_iter_num):
             outputs = self.model(data)
             cur_pred = outputs.max(1, keepdim=True)[1].squeeze()
             # Get successfully attacked indexes
-            self.is_attacked = cur_pred != labels
+            self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)
