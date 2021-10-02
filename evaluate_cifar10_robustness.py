@@ -214,28 +214,6 @@ def load_model(args, ngpus_per_node):
             )
         elif args.stat_dict == 'pat':  # To Debug
             _, model = get_dataset_model(args, dataset_path='../data', dataset_name='cifar')
-
-            # from robustness.datasets import DATASETS
-            # from robustness.attacker import AttackerModel
-            # _dataset = DATASETS['cifar']('../data/')
-            # model = _dataset.get_model(args.arch, False)
-            # model = AttackerModel(model, _dataset)
-            #
-            # checkpoint = torch.load(args.checkpoint)
-            # state_dict_path = 'model'
-            # if not ('model' in checkpoint):
-            #     state_dict_path = 'state_dict'
-            #
-            # sd = checkpoint[state_dict_path]
-            # sd = {k[len('module.'):]: v for k, v in sd.items()}
-            # model.load_state_dict(sd)
-            # print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
-            #
-            # model = nn.Sequential(
-            #     InputNormalize(torch.tensor([0.4914, 0.4822, 0.4465]),
-            #                    torch.tensor([0.2023, 0.1994, 0.2010])),
-            #     model.model
-            # )
         elif args.stat_dict == 'gat-fromscratch':
             model = ResNet50()
         else:
@@ -278,6 +256,17 @@ def load_model(args, ngpus_per_node):
             if args.stat_dict == 'trades':
                 sd = {'module.'+k: v for k, v in checkpoint.items()}  # Use this if missing key matching
                 model.load_state_dict(sd)
+                print("=> loaded checkpoint '{}'".format(args.checkpoint))
+            elif args.stat_dict == 'clean':
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        sd = checkpoint['model_state_dict']
+                        sd = {'module.'+k: v for k, v in sd.items()}  # Use this if missing key matching
+                        model.load_state_dict(sd)
+                    else:
+                        raise ValueError("Please check State Dict key of checkpoint.")
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                    print('nat_accuracy --> ', checkpoint['best_acc1'])
             elif args.stat_dict == 'gat' or args.stat_dict == 'gat-fromscratch':
                 if isinstance(checkpoint, dict):
                     if 'model_state_dict' in checkpoint:

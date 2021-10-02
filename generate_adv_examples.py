@@ -290,7 +290,6 @@ def print_adv_examples(model, val_loader, args):
             # mark examples that changed by less than 1/1000 as not successful
             all_successful[np.all(np.abs(diff) < 1e-3,
                                   axis=(1, 2, 3))] = False
-            print(all_successful)
 
     if args.only_successful:
         out_advs = out_advs[:, all_successful]
