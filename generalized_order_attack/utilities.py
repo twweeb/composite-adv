@@ -338,3 +338,13 @@ class InputNormalize(nn.Module):
         x = torch.clamp(x, 0, 1)
         x_normalized = (x - self.new_mean)/self.new_std
         return x_normalized
+
+
+def get_imagenet_dict():
+    import json
+    class_idx = json.load(open("./labels/imagenet_class_index.json"))
+    id_to_labels = [class_idx[str(k)][1] for k in range(len(class_idx))]
+    nclass_to_id = {class_idx[str(k)][0]: k for k in range(len(class_idx))}
+
+    return id_to_labels, nclass_to_id
+

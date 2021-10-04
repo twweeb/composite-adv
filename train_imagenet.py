@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 from generalized_order_attack.utilities import imshow, InputNormalize
 from torch.autograd import Variable
 from generalized_order_attack.attacks import *
-import json
 
 
 def list_type(s):
@@ -35,7 +34,7 @@ parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train')
-parser.add_argument('--weight-decay', '--wd', default=2e-4,
+parser.add_argument('--weight-decay', '--wd', default=1e-4,
                     type=float, metavar='W')
 parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                     help='learning rate')
@@ -53,7 +52,7 @@ parser.add_argument('--beta', default=6.0, type=float,
                     help='regularization, i.e., 1/lambda in TRADES')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--print-freq', type=int, default=50, metavar='N',
+parser.add_argument('--print-freq', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--arch', default='wideresnet',
                     help='architecture of model')
@@ -81,8 +80,6 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
-                    help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
 parser.add_argument('--dist-file', default=None, type=str, help='distributed config')
 parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
@@ -100,12 +97,10 @@ train_loader_len = None
 
 start_num = 1
 iter_num = 1
-inner_iter_num = 10
+inner_iter_num = 7
 
 sequence_single = [(0,), (1,), (2,), (3,), (4,), (5,)]
 attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
-class_idx = json.load(open("./generalized_order_attack/labels/imagenet_class_index.json"))
-classes_map = [class_idx[str(k)][1] for k in range(len(class_idx))]
 
 
 def find_free_port():
@@ -135,9 +130,6 @@ def main():
                       'which can slow down your training considerably! '
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
-
-    # if args.dist_url == "env://" and args.world_size == -1:
-    #     args.world_size = int(os.environ["WORLD_SIZE"])
 
     # slurm available
     if args.world_size == -1 and "SLURM_NPROCS" in os.environ:
@@ -194,7 +186,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
 
     if args.multiprocessing_distributed:
-        def print_pass(*args):
+        def print_pass(*args, sep=' ', end='\n', file=None):
             pass
         if args.rank > 0:
             builtins.print = print_pass
@@ -241,7 +233,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.stat_dict == 'madry':
             pass
         elif args.stat_dict == 'gat':
-            checkpoint = torch.load(args.checkpoint)  # , pickle_module=dill)
+            checkpoint = torch.load(args.checkpoint, map_location=torch.device('cpu'))  # , pickle_module=dill)
             assert isinstance(checkpoint, dict)
             sd = checkpoint['model_state_dict']
             # sd = {k[len('module.'):]: v for k, v in sd.items()}
@@ -251,7 +243,7 @@ def main_worker(gpu, ngpus_per_node, args):
             if 'optimizer' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer'])
             if 'epoch' in checkpoint:
-                epoch = checkpoint['epoch']
+                epoch = checkpoint['epoch'] + 1
             if 'best_acc1' in checkpoint:
                 best_acc1 = checkpoint['best_acc1']
 
@@ -274,15 +266,13 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
     ])
 
-    DATA_DIR = '/work/hsiung1024/imagenet'  # Original images come in shapes of [3,64,64]
+    DATA_DIR = '/work/hsiung1024/imagenet/'  # Original images come in shapes of [3,64,64]
     # Define training and validation data paths
-    TRAIN_DIR = os.path.join(DATA_DIR, 'train')
-    VALID_DIR = os.path.join(DATA_DIR, 'val')
+    TRAIN_LMDB = os.path.join(DATA_DIR, 'train')
+    VALID_LMDB = os.path.join(DATA_DIR, 'val')
 
-    train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", transform_train, workers=args.workers,
-                                                      batch_size=args.batch_size, distributed=args.distributed)
-    test_loader, _ = generate_dataloader(VALID_DIR, "val", transform_test, workers=args.workers,
-                                         batch_size=args.batch_size)
+    train_loader, train_sampler = generate_dataloader(TRAIN_LMDB, "train", transform_train, args)
+    test_loader, _ = generate_dataloader(VALID_LMDB, "val", transform_test, args)
 
     if args.evaluate:
         validate(test_loader, model, criterion, args)
@@ -290,7 +280,7 @@ def main_worker(gpu, ngpus_per_node, args):
     train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node)
 
 
-def generate_dataloader(data, name, transform, workers, batch_size, distributed=False):
+def generate_dataloader(data, name, transform, args):
     if data is None:
         return None
 
@@ -300,7 +290,7 @@ def generate_dataloader(data, name, transform, workers, batch_size, distributed=
         dataset = datasets.ImageFolder(data, transform=transform)
 
     if name == "train":
-        if distributed:
+        if args.distributed:
             train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         else:
             train_sampler = None
@@ -308,9 +298,9 @@ def generate_dataloader(data, name, transform, workers, batch_size, distributed=
         train_sampler = None
 
     # Wrap image dataset (defined above) in dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size,
+    dataloader = DataLoader(dataset, batch_size=args.batch_size,
                             shuffle=(train_sampler is None),
-                            num_workers=workers,
+                            num_workers=args.workers,
                             pin_memory=True,
                             sampler=train_sampler)
 
@@ -333,7 +323,7 @@ def load_model(args):
 
                 if args.checkpoint and os.path.isfile(args.checkpoint):
                     print("=> loading checkpoint '{}'".format(args.checkpoint))
-                    checkpoint = torch.load(args.checkpoint, pickle_module=dill)
+                    checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
 
                     # Makes us able to load models saved with legacy versions
                     state_dict_path = 'model'
@@ -367,12 +357,22 @@ def load_model(args):
             else:
                 raise NotImplementedError()
         else:
-            model = resnet50(pretrained=True)
-            model = nn.Sequential(
-                InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
-                               torch.tensor([0.229, 0.224, 0.225])),
-                model
-            )
+            if args.stat_dict == 'from_scratch':
+                model = resnet50(pretrained=False)
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    model
+                )
+            elif args.stat_dict == 'finetune_natural':
+                model = resnet50(pretrained=True)
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    model
+                )
+            else:
+                raise ValueError()
     else:
         print('Model architecture not specified.')
         raise ValueError()
@@ -544,22 +544,19 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
             print("Best Test Accuracy: {}%".format(best_acc1))
             # save checkpoint
             save_checkpoint({
-                'epoch': epoch + 1,
+                'epoch': epoch,
                 'arch': args.arch,
                 'model_state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
             }, is_best, args.model_dir)
-
-            print('Save model: {}'.format(os.path.join(args.model_dir, 'model-epoch{}.pt'.format(e))))
-            if is_best:
-                with open(args.log_filename, 'a+') as f:
-                    csv_write = csv.writer(f)
-                    data_row = [e, args.rank,
-                                train_loss, train_acc1, train_acc5,
-                                test_loss, test_acc1, test_acc5,
-                                best_acc1]
-                    csv_write.writerow(data_row)
+            with open(args.log_filename, 'a+') as f:
+                csv_write = csv.writer(f)
+                data_row = [epoch,
+                            train_loss, train_acc1, train_acc5,
+                            test_loss, test_acc1, test_acc5,
+                            best_acc1]
+                csv_write.writerow(data_row)
 
 
 def validate(val_loader, model, criterion, args):
@@ -608,12 +605,13 @@ def validate(val_loader, model, criterion, args):
 def save_checkpoint(state, is_best, model_dir=None):
     filename = os.path.join(model_dir, 'model-epoch{}.pt'.format(state['epoch']))
     torch.save(state, filename)
+    print('Save model: {}'.format(filename))
     if is_best:
         best_cp = os.path.join(model_dir, 'model_best.pth')
         print("Save best model (epoch {})!".format(state['epoch']))
         shutil.copyfile(filename, best_cp)
         print('Save model: {}'.format(best_cp))
-        print('================================================================')
+    print('================================================================')
 
 
 class Normalize(nn.Module):
