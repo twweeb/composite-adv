@@ -255,24 +255,25 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # setup data loader
-    transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])
+    from robustness.data_augmentation import TRAIN_TRANSFORMS_IMAGENET, TEST_TRANSFORMS_IMAGENET
+    # transform_train = transforms.Compose([
+    #     transforms.RandomResizedCrop(224),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    # ])
+    # transform_test = transforms.Compose([
+    #     transforms.Resize(256),
+    #     transforms.CenterCrop(224),
+    #     transforms.ToTensor(),
+    # ])
 
-    DATA_DIR = '/work/hsiung1024/imagenet/'  # Original images come in shapes of [3,64,64]
+    DATA_DIR = '/work/hsiung1024/imagenet/'
     # Define training and validation data paths
-    TRAIN_LMDB = os.path.join(DATA_DIR, 'train')
-    VALID_LMDB = os.path.join(DATA_DIR, 'val')
+    TRAIN_DIR = os.path.join(DATA_DIR, 'train')
+    VALID_DIR = os.path.join(DATA_DIR, 'val')
 
-    train_loader, train_sampler = generate_dataloader(TRAIN_LMDB, "train", transform_train, args)
-    test_loader, _ = generate_dataloader(VALID_LMDB, "val", transform_test, args)
+    train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", TRAIN_TRANSFORMS_IMAGENET, args)
+    test_loader, _ = generate_dataloader(VALID_DIR, "val", TEST_TRANSFORMS_IMAGENET, args)
 
     if args.evaluate:
         validate(test_loader, model, criterion, args)
@@ -447,12 +448,6 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
 
             data_adv = pgd_attack(data_adv, target)
             data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
-            if args.debug:
-                imshow(data, model, classes_map,
-                       ground_truth=target, save_file='images/train/imagenet_adv_train_madry (clean).pdf', show=False)
-                imshow(data_adv, model, classes_map,
-                       ground_truth=target, save_file='images/train/imagenet_adv_train_madry (attack).pdf', show=False)
-                break
 
             model.train()
 
@@ -473,12 +468,6 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
 
             data_adv = pgd_attack(data_adv, target)
             data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
-            if args.debug:
-                imshow(data, model, classes_map,
-                       ground_truth=target, save_file='images/train/imagenet_adv_train_trades (clean).pdf', show=False)
-                imshow(data_adv, model, classes_map,
-                       ground_truth=target, save_file='images/train/imagenet_adv_train_trades (attack).pdf', show=False)
-                break
 
             model.train()
 

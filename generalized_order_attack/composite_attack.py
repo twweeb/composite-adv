@@ -45,7 +45,7 @@ class CompositeAttack(nn.Module):
         self.eps_pool_im_strong = torch.tensor(
             [(-pi, pi), (0.7, 1.3), (-10, 10), (-0.2, 0.2), (0.7, 1.3), (-4 / 255, 4 / 255)])
         self.eps_pool_im_tough = torch.tensor(
-            [(-pi, pi), (0.5, 1.5), (-10, 10), (-0.3, 0.3), (0.5, 1.5), (-4 / 255, 4 / 255)])
+            [(-pi, pi), (0.0, 3.0), (-30, 30), (-0.3, 0.3), (0.50, 2.0), (-4 / 255, 4 / 255)])
         self.eps_pool_custom = [hue_epsilon, sat_epsilon, rot_epsilon, bright_epsilon, contrast_epsilon, linf_epsilon]
 
         if attack_power == 'weak':
@@ -154,7 +154,7 @@ class CompositeAttack(nn.Module):
             outputs = self.model(new_data)
             cur_pred = outputs.max(1, keepdim=True)[1].squeeze()
             # Get successfully attacked indexes
-            self.is_attacked = torch.logical_or(ori_is_attacked, torch.logical_or(ori_is_attacked, cur_pred != labels))
+            self.is_attacked = torch.logical_or(ori_is_attacked, cur_pred != labels)
 
             self.model.zero_grad()
             cost = F.cross_entropy(outputs, labels)

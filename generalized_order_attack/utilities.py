@@ -342,7 +342,7 @@ class InputNormalize(nn.Module):
 
 def get_imagenet_dict():
     import json
-    class_idx = json.load(open("./labels/imagenet_class_index.json"))
+    class_idx = json.load(open("generalized_order_attack/labels/imagenet_class_index.json"))
     id_to_labels = [class_idx[str(k)][1] for k in range(len(class_idx))]
     nclass_to_id = {class_idx[str(k)][0]: k for k in range(len(class_idx))}
 

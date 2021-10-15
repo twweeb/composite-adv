@@ -4,6 +4,7 @@ import os
 import random
 import time
 import warnings
+import dill
 from typing import Dict, List
 import numpy as np
 import torch.backends.cudnn as cudnn
@@ -15,6 +16,7 @@ from torchvision import datasets, transforms
 from torchvision.models import resnet50
 from models.wideresnet import *
 from generalized_order_attack.attacks import *
+from generalized_order_attack.utilities import imshow, InputNormalize, get_dataset_model
 
 warnings.filterwarnings('ignore')
 
@@ -49,9 +51,9 @@ parser.add_argument('--per_example', action='store_true', default=False,
 parser.add_argument('--message', type=str, default="",
                     help='csv message before result')
 parser.add_argument('--seed', type=int, default=0, help='RNG seed')
-
 parser.add_argument('--output', type=str, help='output CSV')
-
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
 parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
@@ -63,15 +65,6 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
-
-
-class Normalize(nn.Module):
-    def __init__(self, mean, std):
-        super().__init__()
-        self.normalize = transforms.Normalize(mean=mean, std=std)
-
-    def forward(self, input_tensor):
-        return self.normalize(input_tensor)
 
 
 def main_worker(gpu, ngpus_per_node, args):
@@ -91,80 +84,6 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
 
     model = load_model(args)
-    cudnn.benchmark = True
-
-    # setup data loader
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])
-
-    DATA_DIR = '/work/hsiung1024/imagenet'  # Original images come in shapes of [3,64,64]
-    # Define training and validation data paths
-    VALID_DIR = os.path.join(DATA_DIR, 'val')
-
-    test_loader = generate_dataloader(VALID_DIR, "val", transform_test, workers=ngpus_per_node * 4,
-                                      batch_size=args.batch_size)
-
-    evaluate(model, test_loader, ngpus_per_node, args)
-
-
-def generate_dataloader(data, name, transform, workers, batch_size, distributed=False):
-    if data is None:
-        return None
-
-    if transform is None:
-        dataset = datasets.ImageFolder(data, transform=transforms.ToTensor())
-    else:
-        dataset = datasets.ImageFolder(data, transform=transform)
-
-    if name == "train":
-        if distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        else:
-            train_sampler = None
-    else:
-        train_sampler = None
-
-    # Wrap image dataset (defined above) in dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size,
-                            shuffle=(train_sampler is None),
-                            num_workers=workers,
-                            pin_memory=True,
-                            sampler=train_sampler)
-
-    return dataloader
-
-
-def load_model(args):
-    if args.arch == 'wideresnet':
-        model = WideResNet(num_classes=200).cuda()
-    elif args.arch == 'resnet50':
-        if args.checkpoint is not None:
-            from robustness.model_utils import make_and_restore_model
-            from robustness.datasets import DATASETS
-            _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
-            model, _ = make_and_restore_model(arch=args.arch,
-                                              dataset=_dataset, resume_path=args.checkpoint)
-            model = model.model
-        else:
-            model = resnet50(pretrained=True)
-    else:
-        print('Model architecture not specified.')
-
-    model = nn.Sequential(
-        Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        model
-    )
-    return model
-
-
-def evaluate(model, val_loader, ngpus_per_node, args):
-    model.eval()
-    print('Cuda available:', torch.cuda.is_available())
-    if torch.cuda.is_available():
-        model.cuda()
 
     attack_names: List[str] = args.attacks
     attacks = []
@@ -172,6 +91,7 @@ def evaluate(model, val_loader, ngpus_per_node, args):
         tmp = eval(attack_name)
         attacks.append(tmp)
 
+    # Send to GPU
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -182,6 +102,7 @@ def evaluate(model, val_loader, ngpus_per_node, args):
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
             attacks = [torch.nn.parallel.DistributedDataParallel(attack, device_ids=[args.gpu]) for attack in attacks]
+
         else:
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model)
@@ -191,8 +112,157 @@ def evaluate(model, val_loader, ngpus_per_node, args):
         model = model.cuda(args.gpu)
         attacks = [attack.cuda(args.gpu) for attack in attacks]
     else:
-        model = torch.nn.DataParallel(model).cuda()
-        attacks = [torch.nn.DataParallel(attack).cuda() for attack in attacks]
+        # DataParallel will divide and allocate batch_size to all available GPUs
+        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+            model.features = torch.nn.DataParallel(model.features)
+            model.cuda()
+            attacks = [attack.cuda() for attack in attacks]
+        else:
+            model = torch.nn.DataParallel(model).cuda()
+            attacks = [torch.nn.DataParallel(attack).cuda() for attack in attacks]
+
+    if args.checkpoint:
+        if args.stat_dict == 'gat':
+            checkpoint = torch.load(args.checkpoint, map_location=torch.device('cpu'))  # , pickle_module=dill)
+            assert isinstance(checkpoint, dict)
+            sd = checkpoint['model_state_dict']
+            # sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+            if 'epoch' in checkpoint:
+                epoch = checkpoint['epoch'] + 1
+                print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
+            else:
+                print("=> loaded checkpoint '{}'".format(args.checkpoint))
+        else:
+            pass
+
+    cudnn.benchmark = True
+
+    # setup data loader
+    from robustness.data_augmentation import TEST_TRANSFORMS_IMAGENET
+
+    DATA_DIR = '/work/hsiung1024/imagenet'  # Original images come in shapes of [3,64,64]
+    # Define training and validation data paths
+    VALID_DIR = os.path.join(DATA_DIR, 'val')
+
+    test_loader, _ = generate_dataloader(VALID_DIR, "val", TEST_TRANSFORMS_IMAGENET, args)
+
+    evaluate(model, test_loader, attack_names, attacks, args)
+
+
+def generate_dataloader(data, name, transform, args):
+    if data is None:
+        return None
+
+    if transform is None:
+        dataset = datasets.ImageFolder(data, transform=transforms.ToTensor())
+    else:
+        dataset = datasets.ImageFolder(data, transform=transform)
+
+    if name == "train":
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        else:
+            train_sampler = None
+    else:
+        train_sampler = None
+
+    # Wrap image dataset (defined above) in dataloader
+    dataloader = DataLoader(dataset, batch_size=args.batch_size,
+                            shuffle=(train_sampler is None),
+                            num_workers=args.workers,
+                            pin_memory=True,
+                            sampler=train_sampler)
+
+    return dataloader, train_sampler
+
+
+def load_model(args):
+    # init model, ResNet18() can also be used for training here
+
+    if args.arch == 'wideresnet':
+        raise NotImplementedError()
+    elif args.arch == 'resnet50':
+        if args.checkpoint is not None:
+            if args.stat_dict == 'madry':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                model = _dataset.get_model(args.arch, False)
+                model = AttackerModel(model, _dataset)
+
+                if args.checkpoint and os.path.isfile(args.checkpoint):
+                    print("=> loading checkpoint '{}'".format(args.checkpoint))
+                    checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
+
+                    # Makes us able to load models saved with legacy versions
+                    state_dict_path = 'model'
+                    if not ('model' in checkpoint):
+                        state_dict_path = 'state_dict'
+
+                    sd = checkpoint[state_dict_path]
+                    sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                elif args.checkpoint:
+                    error_msg = "=> no checkpoint found at '{}'".format(args.checkpoint)
+                    raise ValueError(error_msg)
+
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    model.model
+                )
+            elif args.stat_dict == 'gat':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                model = _dataset.get_model(args.arch, False)
+                model = AttackerModel(model, _dataset)
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    model.model
+                )
+            elif args.stat_dict == 'fast_fgsm':
+                model = resnet50(pretrained=False)
+                print("=> loading checkpoint '{}'".format(args.checkpoint))
+                checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
+
+                # Makes us able to load models saved with legacy versions
+                state_dict_path = 'model'
+                if not ('model' in checkpoint):
+                    state_dict_path = 'state_dict'
+
+                sd = checkpoint[state_dict_path]
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+                model.load_state_dict(sd)
+                print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                print("=> best prec1: {}".format(checkpoint['best_prec1']))
+                model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    model
+                )
+            else:
+                raise NotImplementedError()
+        else:
+            model = resnet50(pretrained=True)
+            model = nn.Sequential(
+                InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                               torch.tensor([0.229, 0.224, 0.225])),
+                model
+            )
+            print("Use Pytorch Pretrained Model")
+    else:
+        print('Model architecture not specified.')
+        raise ValueError()
+
+    return model
+
+
+def evaluate(model, val_loader, attack_names, attacks, args):
+    model.eval()
 
     batches_correct: Dict[str, List[torch.Tensor]] = \
         {attack_name: [] for attack_name in attack_names}
@@ -210,9 +280,9 @@ def evaluate(model, val_loader, ngpus_per_node, args):
         ):
             break
 
-        if torch.cuda.is_available():
-            inputs = inputs.cuda()
-            labels = labels.cuda()
+        if args.gpu is not None:
+            inputs = inputs.cuda(args.gpu, non_blocking=True)
+        labels = labels.cuda(args.gpu, non_blocking=True)
 
         for attack_name, attack in zip(attack_names, attacks):
             batch_tic = time.perf_counter()
@@ -285,7 +355,11 @@ def main():
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         random.seed(args.seed)
-        # cudnn.deterministic = True
+        cudnn.deterministic = True
+
+    if args.gpu is not None:
+        warnings.warn('You have chosen a specific GPU. This will completely '
+                      'disable data parallelism.')
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -293,11 +367,7 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
     ngpus_per_node = torch.cuda.device_count()
     if args.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function

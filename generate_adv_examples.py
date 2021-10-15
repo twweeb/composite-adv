@@ -6,6 +6,7 @@ import argparse
 import itertools
 import random
 import os
+import dill
 import numpy as np
 from torchvision.utils import save_image
 import torch.backends.cudnn as cudnn
@@ -15,7 +16,7 @@ from torchvision.models import resnet50
 from models.wideresnet import *
 from models.resnet import *
 from generalized_order_attack.attacks import *
-from generalized_order_attack.utilities import InputNormalize, get_dataset_model
+from generalized_order_attack.utilities import InputNormalize, get_dataset_model, get_imagenet_dict
 import warnings
 from math import pi
 warnings.filterwarnings('ignore')
@@ -67,6 +68,7 @@ parser.add_argument('--output', type=str,
                     help='output PNG file')
 
 cifar_namelist = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+imagenet_namelist, _ = get_imagenet_dict()
 
 
 def generate_dataloader(data, dataset_name, shuffle, workers, batch_size):
@@ -95,9 +97,46 @@ def generate_dataloader(data, dataset_name, shuffle, workers, batch_size):
 
 def load_imagenet_model(args):
     if args.arch == 'wideresnet':
-        _model = WideResNet(num_classes=200).cuda()
+        raise NotImplementedError()
     elif args.arch == 'resnet50':
-        _model = resnet50(pretrained=True)
+        if args.checkpoint is not None:
+            if args.stat_dict == 'madry':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                _model = _dataset.get_model(args.arch, False)
+                _model = AttackerModel(_model, _dataset)
+
+                if args.checkpoint and os.path.isfile(args.checkpoint):
+                    print("=> loading checkpoint '{}'".format(args.checkpoint))
+                    checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
+
+                    # Makes us able to load models saved with legacy versions
+                    state_dict_path = 'model'
+                    if not ('model' in checkpoint):
+                        state_dict_path = 'state_dict'
+
+                    sd = checkpoint[state_dict_path]
+                    sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    _model.load_state_dict(sd)
+                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                elif args.checkpoint:
+                    error_msg = "=> no checkpoint found at '{}'".format(args.checkpoint)
+                    raise ValueError(error_msg)
+                _model = _model.model
+
+            elif args.stat_dict == 'gat':
+                from robustness.datasets import DATASETS
+                from robustness.attacker import AttackerModel
+                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
+                _model = _dataset.get_model(args.arch, False)
+                _model = AttackerModel(_model, _dataset)
+                _model = _model.model
+
+            else:
+                raise NotImplementedError()
+        else:
+            _model = resnet50(pretrained=True)
     else:
         print('Model architecture not specified.')
         raise ValueError()
@@ -107,6 +146,28 @@ def load_imagenet_model(args):
                        torch.tensor([0.229, 0.224, 0.225])),
         _model
     )
+
+    # Send to GPU
+    if not torch.cuda.is_available():
+        print('using CPU, this will be slow')
+    else:
+        _model = torch.nn.DataParallel(_model).cuda()
+
+    if args.checkpoint:
+        if args.stat_dict == 'gat':
+            checkpoint = torch.load(args.checkpoint, map_location=torch.device('cpu'))  # , pickle_module=dill)
+            assert isinstance(checkpoint, dict)
+            sd = checkpoint['model_state_dict']
+            # sd = {k[len('module.'):]: v for k, v in sd.items()}
+            _model.load_state_dict(sd)
+            if 'epoch' in checkpoint:
+                epoch = checkpoint['epoch'] + 1
+                print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
+            else:
+                print("=> loaded checkpoint '{}'".format(args.checkpoint))
+        else:
+            pass
+
     return _model
 
 
@@ -257,7 +318,7 @@ def print_adv_examples(model, val_loader, args):
     all_labels[0] = orig_labels.cpu().detach().numpy()
 
     for attack_index, attack_name in enumerate(attacks):
-        print(f'generating examples for {attack_name or "no"} attack')
+        # print(f'generating examples for {attack_name or "no"} attack')
 
         attack_params = None
         if attack_name is None:
@@ -273,10 +334,10 @@ def print_adv_examples(model, val_loader, args):
             successful = (adv_labels != labels).cpu().detach().numpy() \
                 .astype(bool)
 
-            print(f'accuracy = {np.mean(1 - successful) * 100:.1f}')
+            # print(f'accuracy = {np.mean(1 - successful) * 100:.1f}')
             diff = (advs - inputs).cpu().detach().numpy()
             advs = advs.cpu().detach().numpy()
-            if attack_index < args.robust_num:
+            if attack_index <= args.robust_num:
                 out_advs[attack_index, unsuccessful] = advs[unsuccessful]
                 out_diffs[attack_index, unsuccessful] = diff[unsuccessful]
                 all_successful[successful] = False
@@ -295,6 +356,17 @@ def print_adv_examples(model, val_loader, args):
         out_advs = out_advs[:, all_successful]
         out_diffs = out_diffs[:, all_successful]
         all_labels = all_labels[:, all_successful]
+
+    for image_index in range(all_labels.shape[1]):
+        if 'cifar' in args.dataset:
+            predict_label = [cifar_namelist[label] for label in all_labels[:, image_index]]
+        else:
+            predict_label = [imagenet_namelist[label] for label in all_labels[:, image_index]]
+
+        print(
+            f'image {image_index} labels:',
+            ' '.join(map(str, predict_label)),
+        )
 
     out_diffs = np.clip(out_diffs * 3 + 0.5, 0, 1)
 
