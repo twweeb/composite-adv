@@ -59,6 +59,10 @@ parser.add_argument('--layout', type=str, default='vertical',
                          '(horizontal) or column (vertical)')
 parser.add_argument('--robust_num', type=int, default=0,
                     help='numbers of attacks use unsuccessful examples')
+parser.add_argument('--only_orig_successful', action='store_true',
+                    default=False,
+                    help='only show images where being classified correctly'
+                         'without being attacked')
 parser.add_argument('--only_successful', action='store_true',
                     default=False,
                     help='only show images where adversarial example '
@@ -133,10 +137,32 @@ def load_imagenet_model(args):
                 _model = AttackerModel(_model, _dataset)
                 _model = _model.model
 
+            elif args.stat_dict == 'fast_fgsm':
+                _model = resnet50(pretrained=False)
+                print("=> loading checkpoint '{}'".format(args.checkpoint))
+                checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
+
+                # Makes us able to load models saved with legacy versions
+                state_dict_path = 'model'
+                if not ('model' in checkpoint):
+                    state_dict_path = 'state_dict'
+
+                sd = checkpoint[state_dict_path]
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+                _model.load_state_dict(sd)
+                print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
+                print("=> best prec1: {}".format(checkpoint['best_prec1']))
+                _model = nn.Sequential(
+                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
+                                   torch.tensor([0.229, 0.224, 0.225])),
+                    _model
+                )
             else:
                 raise NotImplementedError()
         else:
+            print("=> loading PyTorch Pretrained model")
             _model = resnet50(pretrained=True)
+            print("=> loaded PyTorch Pretrained model")
     else:
         print('Model architecture not specified.')
         raise ValueError()
@@ -301,9 +327,12 @@ def load_cifar10_model(args):
     return model
 
 
-def print_adv_examples(model, val_loader, args):
-    inputs, labels = next(itertools.islice(
-        val_loader, args.batch_index, None))
+def print_adv_examples(model, val_loader, args, given_data=None):
+    if given_data is not None:
+        inputs, labels = given_data
+    else:
+        inputs, labels = next(itertools.islice(
+            val_loader, args.batch_index, None))
     if torch.cuda.is_available():
         inputs, labels = inputs.cuda(), labels.cuda()
     N, C, H, W = inputs.size()
@@ -313,7 +342,9 @@ def print_adv_examples(model, val_loader, args):
     out_diffs = np.ones_like(out_advs)
 
     orig_labels = model(inputs).argmax(1)
+    orig_successful = np.zeros(N, dtype=bool)
     all_successful = np.ones(N, dtype=bool)
+    stay = np.ones(N, dtype=bool)
     all_labels = np.zeros((len(attacks), len(orig_labels)), dtype=int)
     all_labels[0] = orig_labels.cpu().detach().numpy()
 
@@ -324,6 +355,9 @@ def print_adv_examples(model, val_loader, args):
         if attack_name is None:
             out_advs[attack_index] = inputs.cpu().numpy()
             out_diffs[attack_index] = 0
+            successful = (orig_labels == labels).cpu().detach().numpy()\
+                .astype(bool)
+            orig_successful[successful] = True
         else:
             attack = eval(attack_name)
 
@@ -337,13 +371,11 @@ def print_adv_examples(model, val_loader, args):
             # print(f'accuracy = {np.mean(1 - successful) * 100:.1f}')
             diff = (advs - inputs).cpu().detach().numpy()
             advs = advs.cpu().detach().numpy()
+            out_advs[attack_index] = advs
+            out_diffs[attack_index] = diff
             if attack_index <= args.robust_num:
-                out_advs[attack_index, unsuccessful] = advs[unsuccessful]
-                out_diffs[attack_index, unsuccessful] = diff[unsuccessful]
                 all_successful[successful] = False
             else:
-                out_advs[attack_index, successful] = advs[successful]
-                out_diffs[attack_index, successful] = diff[successful]
                 all_successful[unsuccessful] = False
 
             all_labels[attack_index] = adv_labels.cpu().detach().numpy()
@@ -352,10 +384,13 @@ def print_adv_examples(model, val_loader, args):
             all_successful[np.all(np.abs(diff) < 1e-3,
                                   axis=(1, 2, 3))] = False
 
+    if args.only_orig_successful:
+        stay = np.logical_and(stay, orig_successful)
     if args.only_successful:
-        out_advs = out_advs[:, all_successful]
-        out_diffs = out_diffs[:, all_successful]
-        all_labels = all_labels[:, all_successful]
+        stay = np.logical_and(stay, all_successful)
+    out_advs = out_advs[:, stay]
+    out_diffs = out_diffs[:, stay]
+    all_labels = all_labels[:, stay]
 
     for image_index in range(all_labels.shape[1]):
         if 'cifar' in args.dataset:
@@ -404,10 +439,12 @@ def print_adv_examples(model, val_loader, args):
                 row.append(diff)
             rows.append(np.concatenate(row[1:], axis=2))
         combined_image = np.concatenate(rows, axis=1)
+    elif args.layout == 'no_print':
+        return out_advs, out_diffs, all_labels, orig_successful
     else:
         raise ValueError(f'Unknown layout "{args.layout}"')
     save_image(torch.from_numpy(combined_image), args.output)
-    return True
+    return out_advs, out_diffs, all_labels, orig_successful
 
 
 def main():
@@ -436,7 +473,8 @@ def main():
     examples_found = False
     while not examples_found:
         try:
-            examples_found = print_adv_examples(model, val_loader, args)
+            print_adv_examples(model, val_loader, args)
+            examples_found = True
         except ValueError:
             examples_found = False
 
