@@ -480,7 +480,7 @@ class CompositeAttack(nn.Module):
             adv_val_saved = torch.zeros((attack_num, self.batch_size)).cuda()
         for i in range(self.start_num):
             adv_val = [self.adv_val_space[idx][i] for idx in range(attack_num)]
-            if adv_val_saved is not None:
+            if self.is_attacked.sum() > 0:
                 for att_id in range(attack_num):
                     if att_id == self.linf_idx:
                         continue
