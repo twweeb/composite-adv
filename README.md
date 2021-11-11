@@ -109,7 +109,7 @@ python3 train_imagenet.py \
 ```
 
 ### Generate Loss Landscape
-Building...
+Look for the `loss_landscape_analysis_ImageNet.ipynb` notebook for more details.
 
 
 ## Ack
