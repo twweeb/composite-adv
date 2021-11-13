@@ -224,13 +224,13 @@ def plot_loss_landscape(model_list, attack, bound, data_loader, start_num, iter_
         if attack == 0:
             subfig[1].set_xticklabels(['$-$π', '$-$π/$2$', '$0$', 'π/$2$', 'π'])
         elif attack == 1:
-            subfig[1].set_xticklabels(['$0.7$', '$0.85$', '$0$', '$1.15$', '$1.3$'])
+            subfig[1].set_xticklabels(['$0.7$', '$0.85$', '$1.0$', '$1.15$', '$1.3$'])
         elif attack == 2:
             subfig[1].set_xticklabels(['$-10\degree$', '$-5\degree$', '$0\degree$', '$5\degree$', '$10\degree$'])
         elif attack == 3:
             subfig[1].set_xticklabels(['$-0.2$', '$-0.1$', '$0$', '$0.1$', '$0.2$'])
         elif attack == 4:
-            subfig[1].set_xticklabels(['$0.7$', '$0.85$', '$0$', '$1.15$', '$1.3$'])
+            subfig[1].set_xticklabels(['$0.7$', '$0.85$', '$1.0$', '$1.15$', '$1.3$'])
         plt.xticks(fontsize=20, fontproperties=myfont)
         plt.yticks(fontsize=20, fontproperties=myfont)
         plt.ticklabel_format(axis='y', style='sci', scilimits=(0, 0), useOffset=False, useMathText=True)
