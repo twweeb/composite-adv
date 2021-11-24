@@ -17,7 +17,7 @@ import warnings
 warnings.filterwarnings('ignore')
 rcParams['font.family'] = 'serif'
 rcParams['mathtext.fontset'] = 'cm'
-myfont = fm.FontProperties(fname=r'/home/hsiung/labs/NimbusRomNo9L-Reg.otf', size=12) # Font Setting
+myfont = fm.FontProperties(fname=r'/home/hsiung/labs/NimbusRomNo9L-Reg.otf', size=16) # Font Setting
 
 
 loss = nn.CrossEntropyLoss()
@@ -218,7 +218,7 @@ def plot_loss_landscape(model_list, attack, bound, data_loader, start_num, iter_
             subfig[1].plot(x_axis_list[i], y_axis_list[i], '-',
                            label=model_name_list[i])
             if attack == 0:
-                subfig[1].legend(loc='upper left', prop=myfont) #{'size': 12}
+                subfig[1].legend(loc='upper right', prop=myfont) #{'size': 12}
 
         subfig[1].set_xticks([round((bound[1] - bound[0]) * i / 4 + bound[0], 2) for i in range(5)])
         if attack == 0:
