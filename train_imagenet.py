@@ -1,25 +1,23 @@
 from __future__ import print_function
-import warnings
+import os
 import argparse
 import shutil
-import csv
-import dill
 import builtins
+import csv
+import random
 import time
-import os
-import torch.multiprocessing as mp
-import torch.nn.parallel
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-from torch.utils.data import SubsetRandomSampler, DataLoader
-from torchvision import datasets, transforms
-import numpy as np
-import random
-from torchvision.models import resnet50
-import matplotlib.pyplot as plt
-from generalized_order_attack.utilities import imshow, InputNormalize
+import torch.multiprocessing as mp
+import torch.nn.parallel
 from torch.autograd import Variable
-from generalized_order_attack.attacks import *
+from composite_adv.attacks import *
+from composite_adv.utilities import make_dataloader, EvalModel
+from composite_adv.data_augmentation import TRAIN_TRANSFORMS_IMAGENET, TEST_TRANSFORMS_IMAGENET
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
 
 
 def list_type(s):
@@ -42,12 +40,6 @@ parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                     help='SGD momentum')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
-parser.add_argument('--epsilon', default=0.031,
-                    help='perturbation')
-parser.add_argument('--num-steps', default=10,
-                    help='perturb number of steps')
-parser.add_argument('--step-size', default=0.007,
-                    help='perturb step size')
 parser.add_argument('--beta', default=6.0, type=float,
                     help='regularization, i.e., 1/lambda in TRADES')
 parser.add_argument('--seed', default=None, type=int,
@@ -56,10 +48,8 @@ parser.add_argument('--print-freq', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--arch', default='wideresnet',
                     help='architecture of model')
-parser.add_argument('--model-dir', default='./model-cifar-wideResNet',
+parser.add_argument('--model-dir', default='./model-imagenet',
                     help='directory of model for saving checkpoint')
-parser.add_argument('--save-freq', '-s', default=1, type=int, metavar='N',
-                    help='save frequency')
 parser.add_argument('--dist', default='comp', type=str,
                     help='distance metric')
 parser.add_argument('--mode', default='natural', type=str,
@@ -72,7 +62,6 @@ parser.add_argument('--order', default='random', type=str, help='specify the ord
 parser.add_argument('--stat-dict', type=str, default=None,
                     help='key of stat dict in checkpoint')
 parser.add_argument("--enable", type=list_type, default=(0, 1), help="list of enabled attacks")
-parser.add_argument("--power", type=str, default='strong', help="level of attack power")
 parser.add_argument("--log_filename", default='logfile.csv', help="filename of output log")
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
@@ -98,9 +87,6 @@ train_loader_len = None
 start_num = 1
 iter_num = 1
 inner_iter_num = 7
-
-sequence_single = [(0,), (1,), (2,), (3,), (4,), (5,)]
-attack_name = ["Hue", "Saturate", "Rotate", "Bright", "Contrast", "L-Infinity"]
 
 
 def find_free_port():
@@ -164,16 +150,10 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1, epoch, iteration
     args.gpu = gpu
 
-    if args.rank != -1:
-        if args.gpu is not None and args.gpu % ngpus_per_node == 0:
-            print("Node {} uses {} GPUs for training, ".format(args.rank, ngpus_per_node) +
-                  "multi-processing." if args.multiprocessing_distributed else "single-processing, multi-threading.")
-        elif args.gpu is None:
-            print("Node {} uses {} GPUs for training, ".format(args.rank, ngpus_per_node) +
-                  "multi-processing." if args.multiprocessing_distributed else "single-processing, multi-threading.")
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
 
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
@@ -188,12 +168,17 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.multiprocessing_distributed:
         def print_pass(*args, sep=' ', end='\n', file=None):
             pass
-        if args.rank > 0:
-            builtins.print = print_pass
-        elif args.gpu is not None and args.gpu % ngpus_per_node != 0:
-            builtins.print = print_pass
+        builtins.print = print_pass
 
-    model = load_model(args)
+    from composite_adv.utilities import make_model
+    base_model = make_model(args.arch, 'imagenet', checkpoint_path=args.checkpoint)
+    # Uncomment the following if you want to load their checkpoint to finetuning
+    # from composite_adv.utilities import make_madry_model, make_trades_model
+    # base_model = make_madry_model(args.arch, 'imagenet', checkpoint_path=args.checkpoint)
+
+    model = EvalModel(base_model,
+                      normalize_param={'mean': [0.485, 0.456, 0.406], 'std': [0.229, 0.224, 0.225]},
+                      input_normalized=True)
 
     # Send to GPU
     if not torch.cuda.is_available():
@@ -224,56 +209,13 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    if args.checkpoint:
-        if args.stat_dict == 'madry':
-            pass
-        elif args.stat_dict == 'gat':
-            checkpoint = torch.load(args.checkpoint, map_location=torch.device('cpu'))  # , pickle_module=dill)
-            assert isinstance(checkpoint, dict)
-            sd = checkpoint['model_state_dict']
-            # sd = {k[len('module.'):]: v for k, v in sd.items()}
-            model.load_state_dict(sd)
-            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
-                                  weight_decay=args.weight_decay)
-            if 'optimizer' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
-            if 'epoch' in checkpoint:
-                epoch = checkpoint['epoch'] + 1
-            if 'best_acc1' in checkpoint:
-                best_acc1 = checkpoint['best_acc1']
-
-            print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, epoch))
-            print('best_accuracy --> ', best_acc1)
-        else:
-            pass
-
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     cudnn.benchmark = True
 
-    # setup data loader
-    from robustness.data_augmentation import TRAIN_TRANSFORMS_IMAGENET, TEST_TRANSFORMS_IMAGENET
-    # transform_train = transforms.Compose([
-    #     transforms.RandomResizedCrop(224),
-    #     transforms.RandomHorizontalFlip(),
-    #     transforms.ToTensor(),
-    # ])
-    # transform_test = transforms.Compose([
-    #     transforms.Resize(256),
-    #     transforms.CenterCrop(224),
-    #     transforms.ToTensor(),
-    # ])
-
-    DATA_DIR = '/work/hsiung1024/imagenet/'
-    # Define training and validation data paths
-    TRAIN_DIR = os.path.join(DATA_DIR, 'train')
-    VALID_DIR = os.path.join(DATA_DIR, 'val')
-
-    train_loader, train_sampler = generate_dataloader(TRAIN_DIR, "train", TRAIN_TRANSFORMS_IMAGENET, args)
-    test_loader, _ = generate_dataloader(VALID_DIR, "val", TEST_TRANSFORMS_IMAGENET, args)
+    train_loader, train_sampler = make_dataloader('../data/imagenet/train/', 'imagenet', args.batch_size,
+                                                  TRAIN_TRANSFORMS_IMAGENET, train=True, distributed=args.distributed)
+    test_loader = make_dataloader('../data/imagenet/val/', 'imagenet', args.batch_size,
+                                  TEST_TRANSFORMS_IMAGENET, train=False, distributed=args.distributed)
 
     if args.evaluate:
         validate(test_loader, model, criterion, args)
@@ -281,136 +223,7 @@ def main_worker(gpu, ngpus_per_node, args):
     train(model, optimizer, criterion, train_loader, train_sampler, test_loader, args, ngpus_per_node)
 
 
-def generate_dataloader(data, name, transform, args):
-    if data is None:
-        return None
-
-    if transform is None:
-        dataset = datasets.ImageFolder(data, transform=transforms.ToTensor())
-    else:
-        dataset = datasets.ImageFolder(data, transform=transform)
-
-    if name == "train":
-        if args.distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        else:
-            train_sampler = None
-    else:
-        train_sampler = None
-
-    # Wrap image dataset (defined above) in dataloader
-    dataloader = DataLoader(dataset, batch_size=args.batch_size,
-                            shuffle=(train_sampler is None),
-                            num_workers=args.workers,
-                            pin_memory=True,
-                            sampler=train_sampler)
-
-    return dataloader, train_sampler
-
-
-def load_model(args):
-    # init model, ResNet18() can also be used for training here
-
-    if args.arch == 'wideresnet':
-        raise NotImplementedError()
-    elif args.arch == 'resnet50':
-        if args.checkpoint is not None:
-            if args.stat_dict == 'madry':
-                from robustness.datasets import DATASETS
-                from robustness.attacker import AttackerModel
-                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
-                model = _dataset.get_model(args.arch, False)
-                model = AttackerModel(model, _dataset)
-
-                if args.checkpoint and os.path.isfile(args.checkpoint):
-                    print("=> loading checkpoint '{}'".format(args.checkpoint))
-                    checkpoint = torch.load(args.checkpoint, pickle_module=dill, map_location=torch.device('cpu'))
-
-                    # Makes us able to load models saved with legacy versions
-                    state_dict_path = 'model'
-                    if not ('model' in checkpoint):
-                        state_dict_path = 'state_dict'
-
-                    sd = checkpoint[state_dict_path]
-                    sd = {k[len('module.'):]: v for k, v in sd.items()}
-                    model.load_state_dict(sd)
-                    print("=> loaded checkpoint '{}' (epoch {})".format(args.checkpoint, checkpoint['epoch']))
-                elif args.checkpoint:
-                    error_msg = "=> no checkpoint found at '{}'".format(args.checkpoint)
-                    raise ValueError(error_msg)
-
-                model = nn.Sequential(
-                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
-                                   torch.tensor([0.229, 0.224, 0.225])),
-                    model.model
-                )
-            elif args.stat_dict == 'gat':
-                from robustness.datasets import DATASETS
-                from robustness.attacker import AttackerModel
-                _dataset = DATASETS['imagenet']('/work/hsiung1024/imagenet')
-                model = _dataset.get_model(args.arch, False)
-                model = AttackerModel(model, _dataset)
-                model = nn.Sequential(
-                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
-                                   torch.tensor([0.229, 0.224, 0.225])),
-                    model.model
-                )
-            else:
-                raise NotImplementedError()
-        else:
-            if args.stat_dict == 'from_scratch':
-                model = resnet50(pretrained=False)
-                model = nn.Sequential(
-                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
-                                   torch.tensor([0.229, 0.224, 0.225])),
-                    model
-                )
-            elif args.stat_dict == 'finetune_natural':
-                model = resnet50(pretrained=True)
-                model = nn.Sequential(
-                    InputNormalize(torch.tensor([0.485, 0.456, 0.406]),
-                                   torch.tensor([0.229, 0.224, 0.225])),
-                    model
-                )
-            else:
-                raise ValueError()
-    else:
-        print('Model architecture not specified.')
-        raise ValueError()
-
-    return model
-
-
-def visualize_dataset(viz_dataset, viz_dataloader, _model=None):
-    figure = plt.figure(figsize=(8, 8))
-    cols, rows = 3, 3
-    data_features, data_labels = next(iter(viz_dataloader))
-    if _model is not None:
-        _model.eval()
-        data_features_cuda = data_features.cuda()
-        output = _model(data_features_cuda)
-        data_labels = output.max(1, keepdim=True)[1].cpu()
-
-    print(f"Feature batch shape: {data_features.size()}")
-    print(f"Labels batch shape: {data_labels.size()}")
-    # print(f"Labels: {data_labels}")
-
-    for i in range(1, cols * rows + 1):
-        img, label = data_features[i], data_labels[i]
-        figure.add_subplot(rows, cols, i)
-        plt.title(",".join(viz_dataset.nid_to_words[viz_dataset.ids[label]]))
-        plt.axis("off")
-        npimg = np.transpose(img.squeeze().numpy(), (1, 2, 0))
-        plt.imshow(npimg)
-
-    if _model is not None:
-        plt.savefig('images/tiny_imagenet (model).pdf')
-    else:
-        plt.savefig('images/tiny_imagenet (ground_truth).pdf')
-    plt.show()
-
-
-def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
+def train_ep(args, model, train_loader, composite_attack, optimizer, criterion):
     global epoch, iteration
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -446,7 +259,7 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
             else:
                 data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
 
-            data_adv = pgd_attack(data_adv, target)
+            data_adv = composite_attack(data_adv, target)
             data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
 
             model.train()
@@ -466,7 +279,7 @@ def train_ep(args, model, train_loader, pgd_attack, optimizer, criterion):
             else:
                 data_adv = data.detach() + 0.001 * torch.randn(data.shape).cuda().detach()
 
-            data_adv = pgd_attack(data_adv, target)
+            data_adv = composite_attack(data_adv, target)
             data_adv = Variable(torch.clamp(data_adv, 0.0, 1.0), requires_grad=False)
 
             model.train()
@@ -510,16 +323,16 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
     global best_acc1, epoch, iteration, train_loader_len
     train_loader_len = len(train_loader)
     iteration = epoch*train_loader_len
-    pgd_attack = CompositeAttack(model, args.enable, mode='train', attack_power=args.power,
-                                 start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
-                                 multiple_rand_start=True, order_schedule=args.order)
+    composite_attack = CompositeAttack(model, args.enable, mode='train', linf_epsilon=(-4/255, 4/255),
+                                       start_num=start_num, iter_num=iter_num, inner_iter_num=inner_iter_num,
+                                       multiple_rand_start=True, order_schedule=args.order)
 
     for e in range(epoch, epoch + args.epochs):
         epoch = e
         if args.distributed:
             train_sampler.set_epoch(epoch)
         # adversarial training
-        train_acc1, train_acc5, train_loss = train_ep(args, model, train_loader, pgd_attack, optimizer, criterion)
+        train_acc1, train_acc5, train_loss = train_ep(args, model, train_loader, composite_attack, optimizer, criterion)
 
         test_acc1, test_acc5, test_loss = validate(test_loader, model, criterion, args)
 
@@ -535,7 +348,7 @@ def train(model, optimizer, criterion, train_loader, train_sampler, test_loader,
             save_checkpoint({
                 'epoch': epoch,
                 'arch': args.arch,
-                'model_state_dict': model.state_dict(),
+                'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
             }, is_best, args.model_dir)
@@ -601,15 +414,6 @@ def save_checkpoint(state, is_best, model_dir=None):
         shutil.copyfile(filename, best_cp)
         print('Save model: {}'.format(best_cp))
     print('================================================================')
-
-
-class Normalize(nn.Module):
-    def __init__(self, mean, std):
-        super().__init__()
-        self.normalize = transforms.Normalize(mean=mean, std=std)
-
-    def forward(self, input_tensor):
-        return self.normalize(input_tensor)
 
 
 class AverageMeter(object):
@@ -683,4 +487,3 @@ def accuracy(output, target, topk=(1,)):
 
 if __name__ == '__main__':
     main()
-    # visualize_dataset(testset, test_loader, _model=model)
