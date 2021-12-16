@@ -16,10 +16,10 @@ setuptools.setup(
     install_requires=[
         'kornia>=0.6.1',
         'sinkhorn-knopp>=0.2',
-        'torch>=1.9.1',
-        'torchvision>=0.10.1'
-        'scipy>=1.7.1',
-        'numpy>=1.21.2',
+        'torch>=1.8.1',
+        'torchvision>=0.9.1',
+        'scipy>=1.6.3',
+        'numpy>=1.20.3',
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
