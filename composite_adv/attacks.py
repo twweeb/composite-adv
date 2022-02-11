@@ -2,6 +2,19 @@ import torch.nn as nn
 from .composite_attack import CompositeAttack
 
 
+class NoAttack(nn.Module):
+    """
+    Attack that does nothing.
+    """
+
+    def __init__(self, model=None):
+        super().__init__()
+        self.model = model
+
+    def forward(self, inputs, labels):
+        return inputs
+
+
 class AutoAttack(nn.Module):
     def __init__(self, model, **kwargs):
         super().__init__()
@@ -46,20 +59,3 @@ class AutoLinfAttack(AutoAttack):
             **kwargs,
         )
 
-
-class AutoL2Attack(AutoAttack):
-    def __init__(self, model, dataset_name, bound=None, **kwargs):
-        if bound is None:
-            bound = {
-                'cifar': 1,
-                'imagenet100': 3,
-                'imagenet': 3,
-                'bird_or_bicycle': 10,
-            }[dataset_name]
-
-        super().__init__(
-            model,
-            norm='L2',
-            eps=bound,
-            **kwargs,
-        )
