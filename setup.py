@@ -20,6 +20,7 @@ setuptools.setup(
         'torchvision>=0.9.1',
         'scipy>=1.6.3',
         'numpy>=1.20.3',
+        'requests>=2.27.1'
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

@@ -2,6 +2,7 @@ import torch
 import os
 import time
 import numpy as np
+import requests
 from torch import nn
 from torchvision import datasets, transforms
 from torch.utils.data import SubsetRandomSampler, DataLoader
@@ -20,7 +21,7 @@ def make_dataloader(dataset_path, dataset_name, batch_size, transform=None, trai
         dataset = datasets.CIFAR10(root=dataset_path, train=train, download=True, transform=transform)
     elif 'imagenet' in dataset_name:
         if transform is None:
-            from data_augmentation import TEST_TRANSFORMS_IMAGENET
+            from .data_augmentation import TEST_TRANSFORMS_IMAGENET
             transform = TEST_TRANSFORMS_IMAGENET
         dataset = datasets.ImageFolder(dataset_path, transform=transform)
     else:
@@ -122,6 +123,42 @@ def make_pat_model(arch, dataset_name, checkpoint_path=None):
     pass
 
 
+def download_gdrive(gdrive_id, fname_save):
+    """ source: https://stackoverflow.com/questions/38511444/python-download-files-from-google-drive-using-url """
+    def get_confirm_token(response):
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                return value
+
+        return None
+
+    def save_response_content(response, fname_save):
+        CHUNK_SIZE = 32768
+
+        with open(fname_save, "wb") as f:
+            for chunk in response.iter_content(CHUNK_SIZE):
+                if chunk:  # filter out keep-alive new chunks
+                    f.write(chunk)
+
+    print('Download started: path={} (gdrive_id={})'.format(
+        fname_save, gdrive_id))
+
+    url_base = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+
+    response = session.get(url_base, params={'id': gdrive_id}, stream=True)
+    token = get_confirm_token(response)
+
+    if token:
+        params = {'id': gdrive_id, 'confirm': token}
+        response = session.get(url_base, params=params, stream=True)
+
+    save_response_content(response, fname_save)
+    session.close()
+    print('Download finished: path={} (gdrive_id={})'.format(
+        fname_save, gdrive_id))
+
+
 def robustness_evaluate(model, threat_model, val_loader):
     model.eval()
 
@@ -196,7 +233,8 @@ class EvalModel(nn.Module):
             self.normalizer = InputNormalize(torch.tensor(normalize_param['mean']),
                                              torch.tensor(normalize_param['std']))
         self.input_normalized = input_normalized
-        self.model = model
+        self.model = model.eval()
+
 
     def forward(self, inp):
         if self.input_normalized:
