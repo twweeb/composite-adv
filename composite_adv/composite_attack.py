@@ -14,7 +14,7 @@ class CompositeAttack(nn.Module):
     def __init__(self, model, enabled_attack, mode='eval', local_rank=-1,
                  hue_epsilon=None, sat_epsilon=None, rot_epsilon=None,
                  bright_epsilon=None, contrast_epsilon=None, linf_epsilon=None,
-                 start_num=1, iter_num=5, inner_iter_num=10, multiple_rand_start=True, order_schedule='random'):
+                 start_num=1, iter_num=10, inner_iter_num=10, multiple_rand_start=True, order_schedule='random'):
         super().__init__()
         self.model = model
         self.local_rank = local_rank
