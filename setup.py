@@ -15,14 +15,13 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     install_requires=[
         'torch>=1.4.0',
-        'robustness>=1.1.post2',
         'numpy>=1.16.0',
         'torchvision>=0.5.0',
         'kornia>=0.6.1',
         'sinkhorn-knopp>=0.2',
-        'scipy>=1.6.3',
         'requests>=2.23.0',
-        'advex-uar>=0.0.5.dev0'
+        'advex-uar>=0.0.5.dev0',
+        'scipy',
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
