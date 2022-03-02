@@ -124,37 +124,15 @@ def make_pat_model(arch, dataset_name, checkpoint_path=None):
 
 
 def download_gdrive(gdrive_id, fname_save):
-    """ source: https://stackoverflow.com/questions/38511444/python-download-files-from-google-drive-using-url """
-    def get_confirm_token(response):
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                return value
-
-        return None
-
-    def save_response_content(response, fname_save):
-        CHUNK_SIZE = 32768
-
-        with open(fname_save, "wb") as f:
-            for chunk in response.iter_content(CHUNK_SIZE):
-                if chunk:  # filter out keep-alive new chunks
-                    f.write(chunk)
+    try:
+        import gdown
+    except ModuleNotFoundError:
+        os.system('pip3 install gdown')
+        import gdown
 
     print('Download started: path={} (gdrive_id={})'.format(
         fname_save, gdrive_id))
-
-    url_base = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-
-    response = session.get(url_base, params={'id': gdrive_id}, stream=True)
-    token = get_confirm_token(response)
-
-    if token:
-        params = {'id': gdrive_id, 'confirm': token}
-        response = session.get(url_base, params=params, stream=True)
-
-    save_response_content(response, fname_save)
-    session.close()
+    gdown.download(id=gdrive_id, output=fname_save, quiet=False)
     print('Download finished: path={} (gdrive_id={})'.format(
         fname_save, gdrive_id))
 
@@ -191,9 +169,6 @@ def robustness_evaluate(model, threat_model, val_loader):
         batches_time_used.append(time_used)
 
     print('OVERALL')
-    accuracies = []
-    attack_success_rates = []
-    total_time_used = []
 
     ori_correct = torch.cat(batches_ori_correct)
     attacks_correct = torch.cat(batches_correct)
@@ -204,9 +179,7 @@ def robustness_evaluate(model, threat_model, val_loader):
           f'attack_success_rate = {attack_success_rate * 100:.5f}',
           f'time_usage = {time_used:0.2f} s',
           sep='\t')
-    accuracies.append(accuracy)
-    attack_success_rates.append(attack_success_rate)
-    total_time_used.append(time_used)
+    return accuracy, attack_success_rate
 
 
 class InputNormalize(nn.Module):
