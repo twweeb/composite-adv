@@ -94,14 +94,14 @@ class CompositeAttack(nn.Module):
         self.adv_val_space = [self.adv_val_pool[i] for i in self.enabled_attack]
 
         if self.curr_seq is None:
-            self.curr_dsm = sinkhorn.initial_dsm(self.seq_num)
-            self.curr_seq = sinkhorn.convert_dsm_to_sequence(self.curr_dsm)
-
             if self.order_schedule == 'fixed':
                 self.fixed_order = tuple([self.enabled_attack.index(i) for i in self.fixed_order])
                 self.curr_seq = torch.tensor(self.fixed_order).cuda(self.local_rank) if self.local_rank != -1 else \
                     torch.tensor(self.fixed_order).cuda()
                 self.curr_dsm = sinkhorn.convert_seq_to_dsm(self.curr_seq)
+            else:
+                self.curr_dsm = sinkhorn.initial_dsm(self.seq_num)
+                self.curr_seq = sinkhorn.convert_dsm_to_sequence(self.curr_dsm)
 
             assert self.curr_seq is not None
 
